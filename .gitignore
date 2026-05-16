@@ -1,0 +1,19 @@
+# Environment variables
+.env
+.env.backup
+.env.production
+
+# IDE / Editors
+/.idea
+/.vscode
+/.zed
+/.cursor/
+/.nova
+/.codex
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
