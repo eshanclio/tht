@@ -9,44 +9,43 @@ use App\Domains\Parking\Data\ParkVehicleData;
 use App\Domains\Parking\Data\UnparkVehicleData;
 use App\Domains\Parking\Models\ParkingLot;
 use App\Http\Requests\ParkVehicleRequest;
-use App\Http\Requests\UnparkVehicleRequest;
 use App\Http\Resources\AvailabilityResource;
 use App\Http\Resources\ParkingResource;
 use Illuminate\Http\JsonResponse;
 
-class ParkingController extends Controller
+class ParkingController
 {
-	public function park(ParkVehicleRequest $request, ParkVehicle $action): JsonResponse
-	{
-		$data = new ParkVehicleData(
-			licensePlate: $request->input("license_plate"),
-			vehicleType: $request->vehicleType(),
-			parkingLotId: (int) $request->input("parking_lot_id"),
-		);
+    public function park(ParkVehicleRequest $request, ParkingLot $parkingLot, ParkVehicle $action): JsonResponse
+    {
+        $data = new ParkVehicleData(
+            licensePlate: $request->input('license_plate'),
+            vehicleType: $request->vehicleType(),
+            parkingLotId: $parkingLot->id,
+        );
 
-		$parking = $action->handle($data);
+        $parking = $action->handle($data);
 
-		return (new ParkingResource($parking))
-			->response()
-			->setStatusCode(201);
-	}
+        return (new ParkingResource($parking))
+            ->response()
+            ->setStatusCode(201);
+    }
 
-	public function unpark(UnparkVehicleRequest $request, UnparkVehicle $action): JsonResponse
-	{
-		$data = new UnparkVehicleData(
-			licensePlate: $request->input("license_plate"),
-			parkingLotId: (int) $request->input("parking_lot_id"),
-		);
+    public function unpark(ParkingLot $parkingLot, string $licensePlate, UnparkVehicle $action): JsonResponse
+    {
+        $data = new UnparkVehicleData(
+            licensePlate: $licensePlate,
+            parkingLotId: $parkingLot->id,
+        );
 
-		$action->handle($data);
+        $action->handle($data);
 
-		return response()->json(null, 204);
-	}
+        return response()->json(null, 204);
+    }
 
-	public function availability(ParkingLot $parkingLot, GetLotAvailability $action): JsonResponse
-	{
-		$data = $action->handle($parkingLot->id);
+    public function availability(ParkingLot $parkingLot, GetLotAvailability $action): JsonResponse
+    {
+        $data = $action->handle($parkingLot->id);
 
-		return (new AvailabilityResource($data))->response();
-	}
+        return (new AvailabilityResource($data))->response();
+    }
 }

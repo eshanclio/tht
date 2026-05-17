@@ -1,77 +1,40 @@
-# Parking Lot Management System
+# Parking Lot API
 
-A backend API for managing a multi-tenant parking lot. Built with **Laravel 13** and **PostgreSQL**, using a pragmatic Domain-Driven Design approach.
-
----
-
-## What It Does
-
-The system tracks available spots and manages vehicles as they park and depart. It supports three vehicle types with different spot requirements:
-
-| Vehicle | Motorcycle Spot | Car Spot |
-|---------|----------------|----------|
-| **Motorcycle** | 1 spot | 1 spot (fallback) |
-| **Car** | Not allowed | 1 spot |
-| **Van** | Not allowed | 3 consecutive spots in the same section |
-
-**Capabilities:**
-- **Park** a vehicle by assigning the correct spot(s).
-- **Unpark** a vehicle and free all associated spots.
-- **Check availability** for any parking lot, including available van spaces (derived from consecutive car spots).
+A Laravel 13 + PostgreSQL API for managing a multi-tenant parking lot system. Vehicles are parked, tracked, and released with strict spot-assignment rules and database-level concurrency guarantees.
 
 ---
 
-## Architecture
+## Quick Start
 
-The code is organized into clear layers:
-
-```
-app/
-├── Domains/Parking/
-│   ├── Actions/          # Single-purpose use cases (Park, Unpark, Availability)
-│   ├── Data/             # Enums (SpotType, VehicleType) + DTOs
-│   ├── Models/           # Eloquent models
-│   ├── Services/         # Domain logic (SpotAllocator)
-│   └── Exceptions/       # Domain-specific errors
-│
-├── Http/
-│   ├── Controllers/      # Thin controllers that delegate to Actions
-│   ├── Requests/         # Form request validation
-│   └── Resources/        # API response shaping
-│
-routes/api.php          # API route definitions
-database/
-├── migrations/           # Single combined migration
-└── seeders/              # Fixed lot structure seeder
-tests/Feature/            # Feature tests
+```bash
+cp .env.example .env
+composer install
+php artisan migrate --seed
+php artisan test
 ```
 
-**Why this structure?**
-- **Actions as Services (AaaS)** — Each use case is a single invokable class with one public method. Controllers stay thin and only handle HTTP concerns.
-- **Domain-first grouping** — Everything related to parking lives in one namespace. No need for repository interfaces because Eloquent is used directly.
-- **DTOs for type safety** — `ParkVehicleData`, `UnparkVehicleData`, and `LotAvailabilityData` carry typed data between layers.
+The seeder creates **Main Lot** with two sections (A and B), each containing 5 motorcycle spots (positions 1–5) and 10 car spots (positions 6–15) — 30 spots total.
 
 ---
 
-## API Endpoints
+## API Reference
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `POST` | `/api/park` | Park a vehicle |
-| `POST` | `/api/unpark` | Unpark a vehicle |
-| `GET` | `/api/parking-lots/{id}/availability` | Get lot availability |
+All routes are prefixed with `/api`.
 
 ### Park a Vehicle
-```json
-POST /api/park
-{
-  "license_plate": "ABC-123",
-  "vehicle_type": "car",
-  "parking_lot_id": 1
-}
+
+```
+POST /api/parking-lots/{parkingLot}/sessions
 ```
 
-**Success response (201):**
+The parking lot is identified in the URL path. Route model binding returns `404` if the lot does not exist.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `license_plate` | string | yes | Vehicle identifier from the camera system |
+| `vehicle_type` | string | yes | `motorcycle`, `car`, or `van` |
+
+**Success `201`:**
 ```json
 {
   "id": 1,
@@ -85,237 +48,290 @@ POST /api/park
 }
 ```
 
-**Error responses:**
-- `409` — No available spot, or vehicle is already parked.
-- `400` — Validation error (missing fields, invalid vehicle type, type mismatch for known vehicle).
+**Errors:**
+- `404` — parking lot not found
+- `409` — no available spot, vehicle already parked, or vehicle type mismatch vs. its first-ever record
+- `422` — validation failure (missing fields, unknown vehicle type)
 
 ### Unpark a Vehicle
-```json
-POST /api/unpark
-{
-  "license_plate": "ABC-123",
-  "parking_lot_id": 1
-}
+
+```
+DELETE /api/parking-lots/{parkingLot}/vehicles/{licensePlate}
 ```
 
-**Success response:** `204 No Content`
+Both the lot and the vehicle are identified in the URL. Route model binding returns `404` if the lot does not exist.
 
-**Error responses:**
-- `409` — Vehicle is not currently parked in this lot.
-- `400` — Validation error.
+**Success `204 No Content`.** All assigned spots are freed atomically.
 
-### Check Availability
+**Errors:**
+- `404` — parking lot not found, vehicle not found, or not currently parked in this lot
+
+### Lot Availability
+
 ```
-GET /api/parking-lots/1/availability
+GET /api/parking-lots/{parkingLot}/availability
 ```
 
-**Response:**
+**Success `200`:**
 ```json
 {
   "total_motorcycle_spots": 10,
-  "available_motorcycle_spots": 10,
+  "available_motorcycle_spots": 8,
   "total_car_spots": 20,
-  "available_car_spots": 20,
+  "available_car_spots": 17,
   "total_capacity": 30,
-  "total_available": 30,
-  "available_van_spaces": 6
+  "total_available": 25,
+  "available_van_spaces": 5
 }
 ```
 
-`available_van_spaces` counts how many groups of 3 consecutive car spots exist per section. A van occupies one van space.
+`available_van_spaces` counts non-overlapping groups of 3 consecutive free car spots, computed entirely in SQL.
 
 ---
 
-## Domain Model
+## System Design
 
-### Entities
+### Layered Architecture
 
-- **ParkingLot** — A parking lot (multi-tenant support).
-- **Section** — A row/section within a lot (e.g., "A", "B").
-- **Spot** — An individual parking spot. Type is `motorcycle` or `car`. Occupancy is tracked via `parking_id` (nullable FK). No separate `is_occupied` column or pivot table.
-- **Vehicle** — Identified by license plate. Type is `motorcycle`, `car`, or `van`.
-- **Parking** — A parking session with `started_at` and `ended_at`. When `ended_at` is `null`, the vehicle is currently parked.
-
-### Relationships
-
-- `ParkingLot` has many `Section`s and `Parking`s.
-- `Section` belongs to a `ParkingLot` and has many `Spot`s.
-- `Spot` belongs to a `Section` and optionally belongs to a `Parking`.
-- `Parking` belongs to a `ParkingLot` and a `Vehicle`, and has many `Spot`s.
-- `Vehicle` has many `Parking`s.
-
----
-
-## Spot Allocation Algorithm
-
-The `SpotAllocator` service decides which spot(s) to assign.
-
-### Motorcycle
-1. Try to find an available `motorcycle` spot.
-2. If none, fall back to an available `car` spot.
-3. If still none, reject.
-
-### Car
-1. Find any available `car` spot.
-2. If none, reject (motorcycle spots are not allowed).
-
-### Van
-1. Query all available `car` spots, ordered by `section_id` then `position`.
-2. Group by section.
-3. Within each section, scan for 3 consecutive positions (gaps-and-islands).
-4. If found, lock and allocate all 3 spots atomically.
-5. If no section has 3 consecutive spots, reject.
-
-All allocation queries use `lockForUpdate()` inside a `DB::transaction()` to prevent race conditions between concurrent park requests.
-
----
-
-## Database Schema
-
-A single migration creates all tables in dependency order:
-
-1. `parking_lots` — `id`, `name`
-2. `sections` — `id`, `parking_lot_id`, `name`
-3. `spots` — `id`, `parking_lot_id`, `section_id`, `type`, `position`, `parking_id`
-4. `vehicles` — `id`, `license_plate`, `type`
-5. `parkings` — `id`, `parking_lot_id`, `vehicle_id`, `started_at`, `ended_at`
-
-The `spots.parking_id` foreign key is added **after** `parkings` is created (deferred FK) to respect dependency order.
-
-### Schema Diagram (DBML)
-
-```dbml
-Table parking_lots {
-  id bigint [pk, increment]
-  name varchar
-  created_at timestamp
-  updated_at timestamp
-}
-
-Table sections {
-  id bigint [pk, increment]
-  parking_lot_id bigint [not null, ref: > parking_lots.id]
-  name varchar
-  created_at timestamp
-  updated_at timestamp
-}
-
-Table spots {
-  id bigint [pk, increment]
-  parking_lot_id bigint [not null, ref: > parking_lots.id]
-  section_id bigint [not null, ref: > sections.id]
-  type varchar [not null, note: "'motorcycle' or 'car'"]
-  position int [not null]
-  parking_id bigint [nullable, ref: > parkings.id]
-  created_at timestamp
-  updated_at timestamp
-
-  indexes {
-    (section_id, position) [unique]
-    parking_lot_id
-  }
-}
-
-Table vehicles {
-  id bigint [pk, increment]
-  license_plate varchar [unique, not null]
-  type varchar [not null, note: "'motorcycle', 'car', or 'van'"]
-  created_at timestamp
-  updated_at timestamp
-}
-
-Table parkings {
-  id bigint [pk, increment]
-  parking_lot_id bigint [not null, ref: > parking_lots.id]
-  vehicle_id bigint [not null, ref: > vehicles.id]
-  started_at timestamp [not null]
-  ended_at timestamp [nullable, note: "null = active parking"]
-}
+```
+HTTP Layer                   Domain Layer                    Persistence
+────────────────────────     ──────────────────────────────  ─────────────────────
+ParkVehicleRequest           ParkVehicleData (DTO)
+       │                            │
+ParkingController  ──────►  ParkVehicle (Action)  ──────►  SpotAllocator (Service)
+       │                     UnparkVehicle                          │
+       │                     GetLotAvailability                     ▼
+       ▼                                                   Eloquent Models
+ParkingResource                                            ──────────────────
+AvailabilityResource                                       ParkingLot / Section
+                                                           Spot / Vehicle
+                                                           ParkingSession
 ```
 
-### PostgreSQL Partial Indexes
+- **HTTP layer** (`Http/Requests`, `Http/Controllers`, `Http/Resources`): validates input, hydrates DTOs, serializes responses. Zero business logic. Route model binding resolves `{parkingLot}` to a `ParkingLot` instance; `{licensePlate}` is a plain string URL segment passed directly to the action.
+- **Actions** (`Domains/Parking/Actions`): one class per operation (`ParkVehicle`, `UnparkVehicle`, `GetLotAvailability`). Each action owns a single DB transaction and orchestrates services and models.
+- **Services** (`Domains/Parking/Services`): `SpotAllocator` encapsulates all spot-selection logic. Two public methods: `allocate` (returns spot IDs to claim) and `countAvailableVanSpaces` (pure DB query for the availability endpoint).
+- **Data** (`Domains/Parking/Data`): read-only DTOs (`ParkVehicleData`, `UnparkVehicleData`, `LotAvailabilityData`) and backed enums (`VehicleType`, `SpotType`).
+- **Exceptions** (`Domains/Parking/Exceptions`): domain exceptions implement `render()` so Laravel resolves them directly to JSON responses without modifying any global exception handler.
 
-Four partial indexes are created with raw `DB::statement()` for performance:
+### Database Schema
 
-| Index | Purpose |
-|-------|---------|
-| `spots_available_car_section_idx` | Van allocation — available car spots by section, ordered |
-| `spots_available_motorcycle_lot_idx` | Motorcycle allocation — available motorcycle spots by lot |
-| `spots_available_car_lot_idx` | Car allocation + motorcycle fallback |
-| `parkings_active_idx` | Active parking lookup by vehicle and lot |
+```
+parking_lots
+  id, name
 
-Partial indexes are smaller and faster because they only index rows that matter for allocation queries.
+sections
+  id, parking_lot_id (FK → parking_lots)
+  name
 
----
+spots
+  id
+  parking_lot_id (FK → parking_lots)  ← denormalized from section (see Assumptions)
+  section_id (FK → sections)
+  type       ENUM('motorcycle', 'car')
+  position   INTEGER                  ← ordinal within a section; consecutive = position differs by 1
+  parking_id FK → parkings (nullable) ← NULL = available, non-null = occupied
 
-## Concurrency & Atomicity
+vehicles
+  id, parking_lot_id (FK → parking_lots)
+  license_plate, type
+  UNIQUE(parking_lot_id, license_plate)
 
-- **`lockForUpdate()`** — Used on all allocation queries. PostgreSQL blocks concurrent transactions until the lock holder commits, then the waiting transaction re-evaluates the query against committed data.
-- **`DB::transaction()`** — Wraps the entire park/unpark operation. Either all spot updates succeed or none do.
-- **`createOrFirst()`** — Race-condition-safe vehicle creation (INSERT-first, SELECT on unique violation). Better than `firstOrCreate()` for concurrent environments.
-
----
-
-## Seeding
-
-`ParkingLotSeeder` creates a fixed lot structure:
-- Lot: "Main Lot"
-- Sections: "A", "B"
-- Each section: 5 motorcycle spots (positions 1-5) + 10 car spots (positions 6-15)
-- Total: 30 spots (10 motorcycle, 20 car)
-
----
-
-## Testing
-
-Feature tests cover all core scenarios:
-
-- Motorcycle parks in a motorcycle spot
-- Motorcycle falls back to a car spot when motorcycle spots are full
-- Car parks in a car spot
-- Van parks in 3 consecutive car spots
-- Unpark frees associated spots
-- Car rejected when only motorcycle spots remain
-- Van rejected when car spots are fragmented
-- Van rejected when fewer than 3 car spots exist
-- Park fails when vehicle is already parked
-- Unpark fails when vehicle is not parked
-- Validation errors (missing fields, invalid types)
-- Vehicle type mismatch for known vehicle
-- Availability reflects total capacity and occupied spots
-- Van occupancy reduces available van spaces
-- Multi-tenancy (parking lot isolation)
-
-**Run tests:**
-```bash
-make test
+parkings                               ← Eloquent model: ParkingSession
+  id, parking_lot_id, vehicle_id
+  started_at, ended_at (nullable)     ← ended_at NULL = active session
+  UNIQUE(vehicle_id) WHERE ended_at IS NULL
 ```
 
-All 21 tests pass with 57 assertions.
+**Circular FK:** `spots.parking_id → parkings.id`, but `spots` is created before `parkings` in the migration (because `parkings.vehicle_id` depends on `vehicles`, not on `spots`). The FK is added in a second `Schema::table` pass after `parkings` exists. The migration's `down()` drops this FK explicitly before dropping the tables.
+
+**Partial indexes** (raw `DB::statement`) keep allocation queries small and selective:
+
+| Index | Filter | Used by |
+|---|---|---|
+| `spots_available_car_section_idx` | `type='car' AND parking_id IS NULL` | Van consecutive-spot scan |
+| `spots_available_car_lot_idx` | `type='car' AND parking_id IS NULL` | Car allocation |
+| `parkings_active_vehicle_unique` (UNIQUE) | `ended_at IS NULL` | Duplicate-active-session guard at DB layer + active-session lookup on unpark |
+
+Motorcycle allocation and per-lot availability counts are served by the plain `spots(parking_lot_id)` index — the motorcycle allocator query needs car rows as fallback, so a partial index scoped to motorcycle rows cannot serve it.
+
+### Spot Assignment Rules
+
+| Vehicle | Motorcycle Spot | Car Spot |
+|---|---|---|
+| Motorcycle | ✅ preferred | ✅ fallback when motorcycle spots are full |
+| Car | ❌ | ✅ 1 spot |
+| Van | ❌ | ✅ 3 consecutive spots, same section |
+
+### Spot Allocation — `SpotAllocator`
+
+**Motorcycle:** A single query orders available spots with `CASE WHEN type = 'motorcycle' THEN 0 ELSE 1 END` so motorcycle spots sort first. If none exist the next row is a car spot — no branching required.
+
+**Car:** Straightforward `WHERE type = 'car' AND parking_id IS NULL ORDER BY id LIMIT 1` with a row-level lock.
+
+**Van — consecutive-spot detection:**
+
+1. Fetch all free car spots ordered by `section_id`, then `position`.
+2. Group by `section_id`. Skip sections with fewer than 3 free spots.
+3. Within each section, scan the sorted position list for an index `i` where `positions[i+2] - positions[i] == 2` (three consecutive integers).
+4. The first match is the winning triplet. A follow-up `SELECT ... FOR UPDATE` on those three rows confirms they are still free before the `UPDATE`.
+
+**Van space counting — gaps-and-islands SQL:**
+
+`countAvailableVanSpaces` uses a three-level subquery to avoid loading rows into PHP:
+
+```sql
+-- Level 1: identify each consecutive run using the gaps-and-islands pattern.
+-- Subtracting ROW_NUMBER() from position yields a constant value ("grp") for
+-- spots that belong to the same uninterrupted run within a section.
+SELECT section_id, position - ROW_NUMBER() OVER (PARTITION BY section_id ORDER BY position) AS grp
+FROM spots WHERE type = 'car' AND parking_id IS NULL AND parking_lot_id = ?
+
+-- Level 2: measure the length of each run.
+SELECT COUNT(*) AS run_length FROM level1 GROUP BY section_id, grp
+
+-- Level 3: a run of length L yields floor(L / 3) non-overlapping van slots.
+SELECT COALESCE(SUM(FLOOR(run_length / 3)), 0) FROM level2
+```
+
+### Concurrency & Atomicity
+
+**Vans** must atomically claim three consecutive spots. The implementation uses two layers:
+
+1. **`pg_advisory_xact_lock(namespace, parking_lot_id)`** — Acquired at the start of every van park request within the transaction. This serializes all concurrent van requests for the same lot, ensuring only one transaction at a time performs the consecutive-spot scan and claims spots. The lock is transaction-scoped (released automatically on commit or rollback).
+2. **`SELECT ... FOR UPDATE` on the three candidates** — Belt-and-braces confirmation that all three spots are still free immediately before the `UPDATE`. If any spot was taken between advisory lock acquisition and the row lock, a `NoAvailableSpotException` is raised — no partial reservation ever occurs.
+
+Cars and motorcycles use only `SELECT ... FOR UPDATE` — single-spot allocation is inherently atomic.
+
+**Duplicate-session prevention** operates at two layers:
+
+1. **Application check:** `ParkVehicle` selects any active `ParkingSession` for the vehicle with `lockForUpdate()` before proceeding. If one exists, it throws `VehicleAlreadyParkedException` immediately.
+2. **Database constraint:** `UNIQUE INDEX parkings_active_vehicle_unique ON parkings(vehicle_id) WHERE ended_at IS NULL`. If two concurrent requests both pass the application check (possible in a race), one will hit a `UniqueConstraintViolationException` on insert, which `ParkVehicle` catches and re-raises as `VehicleAlreadyParkedException`.
+
+### Multi-Tenancy
+
+`vehicles` has a `parking_lot_id` column and a `UNIQUE(parking_lot_id, license_plate)` constraint. Consequences:
+
+- The same license plate at two different lots creates two independent `Vehicle` rows with independent types and histories.
+- All allocation and session queries are scoped by `parking_lot_id` — no cross-lot data leaks.
+- A vehicle's type can legitimately differ across lots (the test `test_same_plate_can_park_at_two_different_lots` exercises this).
 
 ---
 
-## Development Environment
+## Assumptions
 
-This project runs inside Docker. No local PHP/PostgreSQL/Redis installation is required.
+**Spot positions are dense integers within a section.** The seeder creates positions 1–15. "Consecutive" means `position[i+1] == position[i] + 1`. The allocator's gap detection (`positions[i+2] - positions[i] == 2`) relies on this integer ordering.
 
-**Prerequisites:** Docker, Docker Compose, Make
+**Sections are never moved between lots.** `spots.parking_lot_id` is denormalized from `sections.parking_lot_id` to make partial indexes on spots selectively target a single lot. If section relocation were ever added, a trigger or app-level invariant check would be required to keep the two columns in sync. This is documented in the migration.
 
-**Setup:**
-```bash
-cp .env.example .env
-make up       # Build and start services
-make key      # Generate APP_KEY
-make migrate  # Run migrations
-make seed     # Seed the database
+**Parking history is retained.** Sessions are closed by setting `ended_at`, never deleted. The unique partial index (`WHERE ended_at IS NULL`) scopes constraints to active rows only. Historical rows accumulate for potential analytics or billing use.
+
+**No authentication or authorization.** Out of scope per the requirements.
+
+**One active session per vehicle per lot.** A vehicle can have parallel active sessions at different lots (multi-tenancy), but attempting a second active session at the same lot returns `409`.
+
+**Vehicle type is immutable after first park.** `firstOrCreate` records the vehicle type on first contact. A subsequent request presenting the same plate with a different type raises `VehicleTypeMismatchException` (409). This prevents accidental reclassification caused by a misconfigured camera system.
+
+**Fixed lot structure.** Dynamic lot/section/spot creation is not exposed via the API. The seeder populates one fixed lot.
+
+---
+
+## Tradeoffs
+
+### Advisory lock for vans vs. pessimistic row-level locking
+
+**Chosen:** `pg_advisory_xact_lock(namespace, lot_id)` + `SELECT ... FOR UPDATE` on the winning spots.
+
+**Alternative:** `SELECT ... FOR UPDATE SKIP LOCKED` on all free car spots in the section, then detect the consecutive run inside the transaction. This avoids the advisory lock but holds row-level locks on many rows for longer, degrading throughput for concurrent car/motorcycle requests in the same section.
+
+The advisory lock is lot-scoped and transaction-scoped — it serializes only van requests per lot and releases automatically on commit/rollback. Car and motorcycle row locks are unaffected.
+
+### Denormalized `spots.parking_lot_id`
+
+**Chosen:** Store `parking_lot_id` on every `Spot` row to make partial indexes on spots selectively target a single lot, avoiding a join through `sections`.
+
+**Tradeoff:** `spots.parking_lot_id` and `sections.parking_lot_id` must stay in sync. This is acceptable because sections are never reassigned via the API. The migration documents this invariant.
+
+### Spot occupancy tracked via a nullable FK on `spots`
+
+**Chosen:** `spots.parking_id IS NULL` means available; a non-null value means occupied.
+
+**Alternative A — a separate `spot_occupancies` join table:** Cleaner history per occupancy event, but the consecutive-spot scan becomes a left join and the availability query adds a subquery. Complexity not justified.
+
+**Alternative B — a boolean `is_occupied` flag:** Duplicate state that can drift from the FK relationship. Rejected.
+
+The nullable FK is self-consistent (enforced by the FK constraint), directly queryable, and requires no extra table.
+
+### Parking history retained (soft-close via `ended_at`)
+
+**Chosen:** Sessions are closed by setting `ended_at`; rows are never deleted.
+
+**Alternative:** Delete the row on unpark. Simpler active-session constraint (no partial index needed), but loses query-able history. Retaining history is more useful for billing, auditing, and analytics in a real system.
+
+### Domain exceptions implement `render()`
+
+**Chosen:** Each domain exception declares `render(Request $request): JsonResponse`. Laravel's exception handler calls this automatically, keeping the response format co-located with the exception class.
+
+**Alternative:** Register exception renderers in `withExceptions()` in `bootstrap/app.php`. This approach is used for the `NotFoundHttpException` handler (which catches model-binding failures and returns a clean `{"message": "ParkingLot not found."}` instead of a debug stack trace), since that exception originates from the framework rather than the domain. Domain exceptions still use `render()` for co-location; framework exceptions are handled centrally.
+
+### Gaps-and-islands SQL for van space counting
+
+**Chosen:** Three-level subquery using `ROW_NUMBER() OVER (PARTITION BY section_id ORDER BY position)` to identify runs, then `FLOOR(run_length / 3)` for non-overlapping van slots.
+
+**Alternative:** Fetch all free car spots into PHP and compute in-process. Simpler to read, but transfers all rows across the wire and does O(n) work in the application tier. The SQL approach is a single round-trip and scales to large lots without memory pressure.
+
+---
+
+## Alternative Approaches Considered
+
+**Event-driven unpark** — Emit a `VehicleUnparked` event and free spots in a listener. Useful if unparking triggers downstream effects (billing, notifications). Unnecessary indirection for this scope; the action handles it directly.
+
+**Dedicated `SpotOccupancy` model** — Track occupancy in a separate table where each row represents one spot in one session. Cleaner history and easier audit trail, but every allocator query becomes a join and the consecutive-spot scan must carry the join through to the window function. Complexity not justified.
+
+**Redis distributed lock for van concurrency** — Replace `pg_advisory_xact_lock` with a Redis `SET NX` or `Redlock`. Necessary only if multiple PostgreSQL primaries or external lock managers are required. For a single primary, the advisory lock is simpler and participates in the DB transaction lifecycle automatically.
+
+**CQRS / pre-computed availability table** — Maintain a denormalized availability table updated by triggers or events. Eliminates the per-request aggregation query. Adds cache-invalidation complexity and eventual consistency that is not justified at this scale.
+
+---
+
+## Project Structure
+
+```
+src/
+├── app/
+│   ├── Domains/
+│   │   └── Parking/
+│   │       ├── Actions/           ParkVehicle, UnparkVehicle, GetLotAvailability
+│   │       ├── Data/              DTOs + enums (VehicleType, SpotType, …)
+│   │       ├── Exceptions/        Self-rendering domain exceptions
+│   │       ├── Models/            ParkingLot, Section, Spot, Vehicle, ParkingSession
+│   │       └── Services/          SpotAllocator
+│   ├── Http/
+│   │   ├── Controllers/           ParkingController
+│   │   ├── Requests/              ParkVehicleRequest
+│   │   └── Resources/             ParkingResource, AvailabilityResource
+│   └── Providers/
+│       └── AppServiceProvider.php
+├── bootstrap/
+│   └── app.php
+├── database/
+│   ├── migrations/
+│   │   └── 2026_05_13_000001_create_parking_schema.php
+│   └── seeders/
+│       ├── DatabaseSeeder.php
+│       └── ParkingLotSeeder.php
+├── routes/
+│   └── api.php
+└── tests/
+    └── Feature/
+        └── ParkingApiTest.php     26 feature tests across 4 groups
 ```
 
-**Common commands:**
-```bash
-make test         # Run PHPUnit
-make fresh        # Fresh migrate + seed
-make artisan CMD="..."   # Run any Artisan command
-make composer CMD="..."  # Run any Composer command
-```
+### Test Coverage Groups
 
-App is available at `http://localhost:8000`.
+| Group | Scenarios |
+|---|---|
+| Golden path | Motorcycle spot, motorcycle fallback to car, car spot, van consecutive spots, unpark car, unpark van (all 3 spots freed) |
+| Rejection / errors | Car blocked when only motorcycle spots remain, van rejected on fragmented spots, van rejected when < 3 spots exist, duplicate park, unpark unknown vehicle, unpark wrong lot |
+| Validation | Missing license plate, invalid vehicle type, nonexistent lot (404), unknown vehicle in lot (404), type mismatch on re-park |
+| State & availability | Capacity totals, occupied spot counts, van space reduction on occupancy, multi-tenancy isolation, full-lot rejection |

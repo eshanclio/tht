@@ -3,67 +3,77 @@
 namespace App\Domains\Parking\Actions;
 
 use App\Domains\Parking\Data\ParkVehicleData;
+use App\Domains\Parking\Data\VehicleType;
 use App\Domains\Parking\Exceptions\VehicleAlreadyParkedException;
-use App\Domains\Parking\Models\Parking;
+use App\Domains\Parking\Exceptions\VehicleTypeMismatchException;
+use App\Domains\Parking\Models\ParkingSession;
 use App\Domains\Parking\Models\Spot;
 use App\Domains\Parking\Models\Vehicle;
 use App\Domains\Parking\Services\SpotAllocator;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Validation\ValidationException;
 
 class ParkVehicle
 {
-	public function __construct(
-		private SpotAllocator $spotAllocator,
-	) {}
+    // Manual namespace for pg_advisory_xact_lock. Bump if other features
+    // start using advisory locks and risk colliding on the same (ns, id) key.
+    private const VAN_LOCK_NAMESPACE = 1;
 
-	public function handle(ParkVehicleData $data): Parking
-	{
-		$vehicle = Vehicle::createOrFirst(
-			["license_plate" => $data->licensePlate],
-			["type" => $data->vehicleType->value]
-		);
+    public function __construct(
+        private SpotAllocator $spotAllocator,
+    ) {}
 
-		if ($vehicle->type->value !== $data->vehicleType->value) {
-			throw ValidationException::withMessages([
-				"vehicle_type" => "Vehicle type does not match the existing record.",
-			]);
-		}
+    public function handle(ParkVehicleData $data): ParkingSession
+    {
+        try {
+            return DB::transaction(function () use ($data) {
+                $vehicle = Vehicle::createOrFirst(
+                    [
+                        'parking_lot_id' => $data->parkingLotId,
+                        'license_plate' => $data->licensePlate,
+                    ],
+                    ['type' => $data->vehicleType],
+                );
 
-		try {
-			return DB::transaction(function () use ($data, $vehicle) {
-				DB::statement(
-					"SELECT pg_advisory_xact_lock(1, ?)",
-					[$data->parkingLotId]
-				);
+                if ($vehicle->type !== $data->vehicleType) {
+                    throw new VehicleTypeMismatchException(
+                        $vehicle->type,
+                        $data->vehicleType,
+                    );
+                }
 
-				$existingParking = Parking::where("vehicle_id", $vehicle->id)
-					->whereNull("ended_at")
-					->lockForUpdate()
-					->first();
+                // Vans need the per-lot advisory lock to make consecutive-spot
+                // allocation atomic across concurrent requests. Cars and
+                // motorcycles rely on SELECT ... FOR UPDATE against the partial
+                // indexes plus the parkings_active_vehicle_unique constraint.
+                if ($data->vehicleType === VehicleType::Van) {
+                    DB::statement(
+                        'SELECT pg_advisory_xact_lock(?, ?)',
+                        [self::VAN_LOCK_NAMESPACE, $data->parkingLotId],
+                    );
+                }
 
-				if ($existingParking) {
-					throw new VehicleAlreadyParkedException();
-				}
+                $spotIds = $this->spotAllocator->allocate(
+                    $data->parkingLotId,
+                    $data->vehicleType,
+                );
 
-				$spotIds = $this->spotAllocator->allocate($data->parkingLotId, $data->vehicleType);
+                // Duplicate active parkings are prevented by the
+                // `parkings_active_vehicle_unique` partial index; a concurrent
+                // INSERT throws UniqueConstraintViolationException, caught below.
+                $parking = ParkingSession::create([
+                    'parking_lot_id' => $data->parkingLotId,
+                    'vehicle_id' => $vehicle->id,
+                    'started_at' => now(),
+                ]);
 
-				$parking = Parking::create([
-					"parking_lot_id" => $data->parkingLotId,
-					"vehicle_id" => $vehicle->id,
-					"started_at" => now(),
-				]);
+                Spot::whereIn('id', $spotIds)
+                    ->update(['parking_id' => $parking->id]);
 
-				Spot::whereIn("id", $spotIds)
-					->update(["parking_id" => $parking->id]);
-
-				$parking->load(["vehicle", "spots"]);
-
-				return $parking;
-			});
-		} catch (UniqueConstraintViolationException) {
-			throw new VehicleAlreadyParkedException();
-		}
-	}
+                return $parking->load(['vehicle', 'spots']);
+            });
+        } catch (UniqueConstraintViolationException) {
+            throw new VehicleAlreadyParkedException;
+        }
+    }
 }

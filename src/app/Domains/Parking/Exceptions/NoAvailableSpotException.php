@@ -9,13 +9,13 @@ use Symfony\Component\HttpFoundation\Response;
 
 class NoAvailableSpotException extends Exception
 {
-	public function __construct(string $message = "No available spot for this vehicle type.")
-	{
-		parent::__construct($message);
-	}
+    public function __construct(string $message = 'No available spot for this vehicle type.')
+    {
+        parent::__construct($message);
+    }
 
-	public function render(Request $request): JsonResponse
-	{
-		return response()->json(["message" => $this->getMessage()], Response::HTTP_CONFLICT);
-	}
+    public function render(Request $request): JsonResponse
+    {
+        return response()->json(['message' => $this->getMessage()], Response::HTTP_CONFLICT);
+    }
 }

@@ -4,7 +4,7 @@ namespace App\Domains\Parking\Data;
 
 enum VehicleType: string
 {
-	case Motorcycle = "motorcycle";
-	case Car = "car";
-	case Van = "van";
+    case Motorcycle = 'motorcycle';
+    case Car = 'car';
+    case Van = 'van';
 }

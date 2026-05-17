@@ -2,7 +2,6 @@
 
 namespace Database\Seeders;
 
-use Database\Seeders\ParkingLotSeeder;
 use Illuminate\Database\Seeder;
 
 class DatabaseSeeder extends Seeder

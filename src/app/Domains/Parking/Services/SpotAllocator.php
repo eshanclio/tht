@@ -6,140 +6,157 @@ use App\Domains\Parking\Data\SpotType;
 use App\Domains\Parking\Data\VehicleType;
 use App\Domains\Parking\Exceptions\NoAvailableSpotException;
 use App\Domains\Parking\Models\Spot;
+use Illuminate\Support\Facades\DB;
 
 class SpotAllocator
 {
-	/**
-	 * @return array<int> Spot IDs to allocate.
-	 * @throws NoAvailableSpotException
-	 */
-	public function allocate(int $parkingLotId, VehicleType $vehicleType): array
-	{
-		return match ($vehicleType) {
-			VehicleType::Motorcycle => $this->allocateMotorcycle($parkingLotId),
-			VehicleType::Car => $this->allocateCar($parkingLotId),
-			VehicleType::Van => $this->allocateVan($parkingLotId),
-		};
-	}
+    /**
+     * @return array<int> Spot IDs to allocate.
+     *
+     * @throws NoAvailableSpotException
+     */
+    public function allocate(int $parkingLotId, VehicleType $vehicleType): array
+    {
+        return match ($vehicleType) {
+            VehicleType::Motorcycle => $this->allocateMotorcycle($parkingLotId),
+            VehicleType::Car => $this->allocateCar($parkingLotId),
+            VehicleType::Van => $this->allocateVan($parkingLotId),
+        };
+    }
 
-	/**
-	 * @return array<int>
-	 * @throws NoAvailableSpotException
-	 */
-	private function allocateMotorcycle(int $parkingLotId): array
-	{
-		$spot = Spot::where("parking_lot_id", $parkingLotId)
-			->where("type", SpotType::Motorcycle->value)
-			->whereNull("parking_id")
-			->lockForUpdate()
-			->first();
+    /**
+     * Motorcycles prefer a motorcycle spot but fall back to a car spot.
+     * One ordered query covers both: motorcycle rows sort first via CASE.
+     *
+     * @return array<int>
+     *
+     * @throws NoAvailableSpotException
+     */
+    private function allocateMotorcycle(int $parkingLotId): array
+    {
+        $spot = Spot::query()
+            ->where('parking_lot_id', $parkingLotId)
+            ->whereNull('parking_id')
+            ->orderByRaw("CASE WHEN type = 'motorcycle' THEN 0 ELSE 1 END")
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->first();
 
-		if (!$spot) {
-			$spot = Spot::where("parking_lot_id", $parkingLotId)
-				->where("type", SpotType::Car->value)
-				->whereNull("parking_id")
-				->lockForUpdate()
-				->first();
-		}
+        if (! $spot) {
+            throw new NoAvailableSpotException;
+        }
 
-		if (!$spot) {
-			throw new NoAvailableSpotException();
-		}
+        return [(int) $spot->id];
+    }
 
-		return [$spot->id];
-	}
+    /**
+     * @return array<int>
+     *
+     * @throws NoAvailableSpotException
+     */
+    private function allocateCar(int $parkingLotId): array
+    {
+        $spot = Spot::query()
+            ->where('parking_lot_id', $parkingLotId)
+            ->where('type', SpotType::Car->value)
+            ->whereNull('parking_id')
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->first();
 
-	/**
-	 * @return array<int>
-	 * @throws NoAvailableSpotException
-	 */
-	private function allocateCar(int $parkingLotId): array
-	{
-		$spot = Spot::where("parking_lot_id", $parkingLotId)
-			->where("type", SpotType::Car->value)
-			->whereNull("parking_id")
-			->lockForUpdate()
-			->first();
+        if (! $spot) {
+            throw new NoAvailableSpotException;
+        }
 
-		if (!$spot) {
-			throw new NoAvailableSpotException();
-		}
+        return [(int) $spot->id];
+    }
 
-		return [$spot->id];
-	}
+    /**
+     * Vans claim three consecutive car spots within the same section.
+     * The per-lot advisory lock (acquired by ParkVehicle) serializes vans
+     * against other vans on the same lot. The initial scan does not issue
+     * row locks, so the re-SELECT ... FOR UPDATE on the three winners is
+     * the guard against a concurrent car allocation grabbing one of those
+     * rows between the scan and the UPDATE.
+     *
+     * @return array<int>
+     *
+     * @throws NoAvailableSpotException
+     */
+    private function allocateVan(int $parkingLotId): array
+    {
+        $spots = Spot::query()
+            ->where('parking_lot_id', $parkingLotId)
+            ->where('type', SpotType::Car->value)
+            ->whereNull('parking_id')
+            ->orderBy('section_id')
+            ->orderBy('position')
+            ->get(['id', 'section_id', 'position']);
 
-	/**
-	 * @return array<int>
-	 * @throws NoAvailableSpotException
-	 */
-	private function allocateVan(int $parkingLotId): array
-	{
-		$spots = Spot::where("parking_lot_id", $parkingLotId)
-			->where("type", SpotType::Car->value)
-			->whereNull("parking_id")
-			->orderBy("section_id")
-			->orderBy("position")
-			->lockForUpdate()
-			->get(["id", "section_id", "position"]);
+        $winningIds = null;
 
-		$grouped = $spots->groupBy("section_id");
+        foreach ($spots->groupBy('section_id') as $sectionSpots) {
+            if ($sectionSpots->count() < 3) {
+                continue;
+            }
 
-		foreach ($grouped as $sectionSpots) {
-			if ($sectionSpots->count() < 3) {
-				continue;
-			}
+            $values = $sectionSpots->values();
+            $positions = $values->pluck('position');
 
-			$positions = $sectionSpots->pluck("position")->values();
+            for ($i = 0; $i <= $positions->count() - 3; $i++) {
+                if ($positions[$i + 2] - $positions[$i] === 2) {
+                    $winningIds = [
+                        (int) $values[$i]->id,
+                        (int) $values[$i + 1]->id,
+                        (int) $values[$i + 2]->id,
+                    ];
+                    break 2;
+                }
+            }
+        }
 
-			for ($i = 0; $i <= $positions->count() - 3; $i++) {
-				if ($positions[$i + 2] - $positions[$i] === 2) {
-					return [
-						$sectionSpots[$i]->id,
-						$sectionSpots[$i + 1]->id,
-						$sectionSpots[$i + 2]->id,
-					];
-				}
-			}
-		}
+        if ($winningIds === null) {
+            throw new NoAvailableSpotException;
+        }
 
-		throw new NoAvailableSpotException();
-	}
+        $locked = Spot::query()
+            ->whereIn('id', $winningIds)
+            ->whereNull('parking_id')
+            ->lockForUpdate()
+            ->get();
 
-	/**
-	 * Count available van spaces (used by GetLotAvailability).
-	 * Reuses the same gaps-and-islands algorithm as allocation,
-	 * but counts all non-overlapping van spaces per run.
-	 */
-	public function countAvailableVanSpaces(int $parkingLotId): int
-	{
-		$availableCarSpots = Spot::where("parking_lot_id", $parkingLotId)
-			->where("type", SpotType::Car->value)
-			->whereNull("parking_id")
-			->orderBy("section_id")
-			->orderBy("position")
-			->get(["section_id", "position"]);
+        if ($locked->count() !== 3) {
+            throw new NoAvailableSpotException;
+        }
 
-		$availableVanSpaces = 0;
-		$grouped = $availableCarSpots->groupBy("section_id");
+        return $winningIds;
+    }
 
-		foreach ($grouped as $sectionSpots) {
-			$positions = $sectionSpots->pluck("position")->values();
-			if ($positions->count() < 3) {
-				continue;
-			}
+    /**
+     * Count van placements via gaps-and-islands. Free car spots within a
+     * section form consecutive runs; subtracting ROW_NUMBER() from position
+     * yields a constant value (`grp`) for each run. Each run of length L
+     * contributes floor(L / 3) non-overlapping van placements.
+     */
+    public function countAvailableVanSpaces(int $parkingLotId): int
+    {
+        $grouped = DB::table('spots')
+            ->where('parking_lot_id', $parkingLotId)
+            ->where('type', SpotType::Car->value)
+            ->whereNull('parking_id')
+            ->selectRaw(
+                'section_id, position - ROW_NUMBER() OVER ('
+                .'PARTITION BY section_id ORDER BY position) AS grp'
+            );
 
-			$runLength = 1;
-			for ($i = 1; $i < $positions->count(); $i++) {
-				if ($positions[$i] - $positions[$i - 1] === 1) {
-					$runLength++;
-				} else {
-					$availableVanSpaces += (int) floor($runLength / 3);
-					$runLength = 1;
-				}
-			}
-			$availableVanSpaces += (int) floor($runLength / 3);
-		}
+        $runs = DB::query()
+            ->fromSub($grouped, 'g')
+            ->selectRaw('COUNT(*) AS run_length')
+            ->groupBy('section_id', 'grp');
 
-		return $availableVanSpaces;
-	}
+        return (int) DB::query()
+            ->fromSub($runs, 'r')
+            ->selectRaw('COALESCE(SUM(FLOOR(run_length / 3)), 0) AS total')
+            ->value('total');
+    }
 }

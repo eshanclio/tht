@@ -4,6 +4,6 @@ namespace App\Domains\Parking\Data;
 
 enum SpotType: string
 {
-	case Motorcycle = "motorcycle";
-	case Car = "car";
+    case Motorcycle = 'motorcycle';
+    case Car = 'car';
 }
