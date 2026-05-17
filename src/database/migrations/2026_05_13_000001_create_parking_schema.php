@@ -39,12 +39,13 @@ return new class extends Migration
                 ->constrained()
                 ->cascadeOnDelete();
             $table->string('type');
-            $table->integer('position');
+            $table->integer('grid_row');
+            $table->integer('grid_column');
             $table->foreignId('parking_id')
                 ->nullable();
             $table->timestamps();
 
-            $table->unique(['section_id', 'position']);
+            $table->unique(['section_id', 'grid_row', 'grid_column']);
             $table->index('parking_lot_id');
         });
 
@@ -100,7 +101,7 @@ return new class extends Migration
             .' WHERE parking_id IS NOT NULL'
         );
         DB::statement(
-            'CREATE INDEX spots_available_car_section_idx ON spots (section_id, position)'
+            'CREATE INDEX spots_available_car_section_idx ON spots (section_id, grid_row, grid_column)'
             ." WHERE type = 'car' AND parking_id IS NULL"
         );
         DB::statement(

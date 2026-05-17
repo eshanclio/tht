@@ -14,16 +14,26 @@ final class ParkingResource extends JsonResource
     {
         return [
             'id' => $this->id,
-            'license_plate' => $this->vehicle->license_plate,
-            'vehicle_type' => $this->vehicle->type->value,
+            'license_plate' => $this->whenLoaded(
+                'vehicle',
+                fn () => $this->vehicle->license_plate,
+            ),
+            'vehicle_type' => $this->whenLoaded(
+                'vehicle',
+                fn () => $this->vehicle->type->value,
+            ),
             'parking_lot_id' => $this->parking_lot_id,
             'started_at' => $this->started_at,
-            'spots' => $this->spots->map(fn ($spot) => [
-                'id' => $spot->id,
-                'type' => $spot->type->value,
-                'section_id' => $spot->section_id,
-                'position' => $spot->position,
-            ])->values(),
+            'spots' => $this->whenLoaded(
+                'spots',
+                fn () => $this->spots->map(fn ($spot) => [
+                    'id' => $spot->id,
+                    'type' => $spot->type->value,
+                    'section_id' => $spot->section_id,
+                    'grid_row' => $spot->grid_row,
+                    'grid_column' => $spot->grid_column,
+                ])->values(),
+            ),
         ];
     }
 }

@@ -13,7 +13,7 @@ php artisan migrate --seed
 php artisan test
 ```
 
-The seeder creates **Main Lot** with two sections (A and B), each containing 5 motorcycle spots (positions 1–5) and 10 car spots (positions 6–15) — 30 spots total.
+The seeder creates **Main Lot** with two sections (A and B), each a 3×5 grid. Row 1 of each section holds 5 motorcycle spots; rows 2 and 3 hold 5 car spots each — 30 spots total.
 
 ---
 
@@ -43,7 +43,7 @@ The parking lot is identified in the URL path. Route model binding returns `404`
   "parking_lot_id": 1,
   "started_at": "2026-05-13T12:00:00.000000Z",
   "spots": [
-    { "id": 12, "type": "car", "section_id": 1, "position": 6 }
+    { "id": 12, "type": "car", "section_id": 1, "grid_row": 2, "grid_column": 1 }
   ]
 }
 ```
@@ -81,11 +81,11 @@ GET /api/parking-lots/{parkingLot}/availability
   "available_car_spots": 17,
   "total_capacity": 30,
   "total_available": 25,
-  "available_van_spaces": 5
+  "available_van_spaces": 4
 }
 ```
 
-`available_van_spaces` counts non-overlapping groups of 3 consecutive free car spots, computed entirely in SQL.
+`available_van_spaces` counts non-overlapping groups of 3 consecutive free car spots **within a single (section, row)**, computed entirely in SQL.
 
 ---
 
@@ -129,7 +129,8 @@ spots
   parking_lot_id (FK → parking_lots)  ← denormalized from section (see Assumptions)
   section_id (FK → sections)
   type       VARCHAR ('motorcycle' or 'car', enforced at the application layer by SpotType enum casts)
-  position   INTEGER                  ← ordinal within a section; consecutive = position differs by 1
+  grid_row    INTEGER                  ← ordinal row within a section
+  grid_column INTEGER                  ← ordinal column within a (section, row); consecutive = differs by 1
   parking_id FK → parkings (nullable) ← NULL = available, non-null = occupied
 
 vehicles
@@ -149,9 +150,10 @@ parkings                               ← Eloquent model: ParkingSession
 
 | Index | Filter | Used by |
 |---|---|---|
-| `spots_available_car_section_idx` | `type='car' AND parking_id IS NULL` | Van consecutive-spot scan |
-| `spots_available_car_lot_idx` | `type='car' AND parking_id IS NULL` | Car allocation |
-| `parkings_active_vehicle_unique` (UNIQUE) | `ended_at IS NULL` | Duplicate-active-session guard at DB layer + active-session lookup on unpark |
+| `spots_available_car_section_idx` on `(section_id, grid_row, grid_column)` | `type='car' AND parking_id IS NULL` | Van consecutive-spot scan |
+| `spots_available_car_lot_idx` on `(parking_lot_id)` | `type='car' AND parking_id IS NULL` | Car allocation |
+| `spots_parking_id_idx` on `(parking_id)` | `parking_id IS NOT NULL` | Unpark: locate all spots belonging to a session |
+| `parkings_active_vehicle_unique` (UNIQUE) on `(vehicle_id)` | `ended_at IS NULL` | Duplicate-active-session guard at DB layer + active-session lookup on unpark |
 
 Motorcycle allocation and per-lot availability counts are served by the plain `spots(parking_lot_id)` index — the motorcycle allocator query needs car rows as fallback, so a partial index scoped to motorcycle rows cannot serve it.
 
@@ -171,24 +173,52 @@ Motorcycle allocation and per-lot availability counts are served by the plain `s
 
 **Van — consecutive-spot detection:**
 
-1. Fetch all free car spots ordered by `section_id`, then `position`.
-2. Group by `section_id`. Skip sections with fewer than 3 free spots.
-3. Within each section, scan the sorted position list for an index `i` where `positions[i+2] - positions[i] == 2` (three consecutive integers).
-4. The first match is the winning triplet. A follow-up `SELECT ... FOR UPDATE` on those three rows confirms they are still free before the `UPDATE`.
+The same gaps-and-islands technique used by `countAvailableVanSpaces` is extended to also return the three winning spot IDs, keeping the entire scan in SQL:
+
+```sql
+-- groups: assign each free car spot a `grp` constant shared by all spots in
+-- the same consecutive run within one (section_id, grid_row).
+WITH groups AS (
+    SELECT id, section_id, grid_row, grid_column,
+           grid_column - ROW_NUMBER() OVER (
+               PARTITION BY section_id, grid_row ORDER BY grid_column
+           ) AS grp
+    FROM spots
+    WHERE parking_lot_id = ? AND type = 'car' AND parking_id IS NULL
+),
+-- runs: keep only runs of ≥ 3 and record the lowest column for tie-breaking.
+runs AS (
+    SELECT section_id, grid_row, grp, MIN(grid_column) AS start_col
+    FROM groups GROUP BY section_id, grid_row, grp HAVING COUNT(*) >= 3
+),
+-- winner: pick the first qualifying run by (section_id, grid_row, start_col).
+winner AS (
+    SELECT section_id, grid_row, grp FROM runs
+    ORDER BY section_id, grid_row, start_col LIMIT 1
+)
+SELECT g.id FROM groups g
+JOIN winner w ON g.section_id = w.section_id
+             AND g.grid_row   = w.grid_row
+             AND g.grp        = w.grp
+ORDER BY g.grid_column LIMIT 3
+```
+
+The query returns exactly 3 spot IDs. A follow-up `SELECT ... FOR UPDATE` on those three rows confirms they are still free immediately before the `UPDATE`.
 
 **Van space counting — gaps-and-islands SQL:**
 
 `countAvailableVanSpaces` uses a three-level subquery to avoid loading rows into PHP:
 
 ```sql
--- Level 1: identify each consecutive run using the gaps-and-islands pattern.
--- Subtracting ROW_NUMBER() from position yields a constant value ("grp") for
--- spots that belong to the same uninterrupted run within a section.
-SELECT section_id, position - ROW_NUMBER() OVER (PARTITION BY section_id ORDER BY position) AS grp
+-- Level 1: identify each consecutive run within one (section, grid_row).
+-- Subtracting ROW_NUMBER() from grid_column yields a constant value
+-- ("grp") for spots that belong to the same uninterrupted run.
+SELECT section_id, grid_row,
+       grid_column - ROW_NUMBER() OVER (PARTITION BY section_id, grid_row ORDER BY grid_column) AS grp
 FROM spots WHERE type = 'car' AND parking_id IS NULL AND parking_lot_id = ?
 
 -- Level 2: measure the length of each run.
-SELECT COUNT(*) AS run_length FROM level1 GROUP BY section_id, grp
+SELECT COUNT(*) AS run_length FROM level1 GROUP BY section_id, grid_row, grp
 
 -- Level 3: a run of length L yields floor(L / 3) non-overlapping van slots.
 SELECT COALESCE(SUM(FLOOR(run_length / 3)), 0) FROM level2
@@ -219,7 +249,7 @@ Cars and motorcycles use only `SELECT ... FOR UPDATE` — single-spot allocation
 
 ## Assumptions
 
-**Spot positions are dense integers within a section.** The seeder creates positions 1–15. "Consecutive" means `position[i+1] == position[i] + 1`. The allocator's gap detection (`positions[i+2] - positions[i] == 2`) relies on this integer ordering.
+**Spots live on a 2D grid within a section.** Each spot has `(grid_row, grid_column)` integer coordinates unique within its section. "Consecutive" for a van means three columns differing by exactly 1 each within a single `(section, grid_row)`. A missing `(section, grid_row, grid_column)` triple is an implicit aisle / non-parking cell.
 
 **Sections are never moved between lots.** `spots.parking_lot_id` is denormalized from `sections.parking_lot_id` to make partial indexes on spots selectively target a single lot. If section relocation were ever added, a trigger or app-level invariant check would be required to keep the two columns in sync. This is documented in the migration.
 
@@ -241,9 +271,28 @@ Cars and motorcycles use only `SELECT ... FOR UPDATE` — single-spot allocation
 
 **Chosen:** `pg_advisory_xact_lock(namespace, lot_id)` + `SELECT ... FOR UPDATE` on the winning spots.
 
-**Alternative:** `SELECT ... FOR UPDATE SKIP LOCKED` on all free car spots in the section, then detect the consecutive run inside the transaction. This avoids the advisory lock but holds row-level locks on many rows for longer, degrading throughput for concurrent car/motorcycle requests in the same section.
+**Why `SELECT ... FOR UPDATE` alone is insufficient for vans:**
 
-The advisory lock is lot-scoped and transaction-scoped — it serializes only van requests per lot and releases automatically on commit/rollback. Car and motorcycle row locks are unaffected.
+Van allocation is a two-step process: (1) scan all free car spots and detect 3 consecutive ones in PHP, then (2) re-`SELECT ... FOR UPDATE` the winners before updating. There is a race window between steps 1 and 2. If two van requests run concurrently:
+
+- Van A finds spots {1, 2, 3} and tries to lock them.
+- Van B finds the same spots {1, 2, 3} and tries to lock them.
+- Van A locks spot 1; Van B locks spot 3. Each waits for the other → **deadlock**.
+
+`pg_advisory_xact_lock(VAN_LOCK_NAMESPACE, lot_id)` eliminates this by serializing all van requests for the same lot before any scan begins. Only one van allocation runs at a time per lot; the scan-then-lock sequence becomes fully atomic from a concurrency perspective.
+
+| | `SELECT ... FOR UPDATE` | `pg_advisory_xact_lock` |
+|---|---|---|
+| Locks | Specific database rows | An application-defined integer key |
+| Targets | Rows that exist | Any logical resource (including multi-step operations) |
+| Deadlock risk | Higher with multi-row locking across transactions | Lower — one key per lot, acquired before any row touches |
+| Scope | Transaction (auto-released on commit/rollback) | Transaction (auto-released on commit/rollback) |
+
+**Why not lock all free car spots upfront with `FOR UPDATE`?** That would block every concurrent car allocation while any van scans its section — degrading throughput unnecessarily. The advisory lock is lot-scoped, not row-scoped: it serializes only van-vs-van on the same lot, leaving car and motorcycle row locks entirely uncontested.
+
+**Why not Redis distributed lock?** Unnecessary for a single PostgreSQL primary. The advisory lock participates in the DB transaction lifecycle automatically — no separate release call, no TTL management, no split-brain risk.
+
+**Alternative considered:** `SELECT ... FOR UPDATE SKIP LOCKED` on all free car spots in the section, then detect the consecutive run inside the transaction. Avoids the advisory lock but holds row-level locks on many rows for the full duration of the scan, blocking concurrent car/motorcycle allocations in the same section.
 
 ### Denormalized `spots.parking_lot_id`
 
@@ -273,9 +322,17 @@ The nullable FK is self-consistent (enforced by the FK constraint), directly que
 
 **Alternative:** Register exception renderers in `withExceptions()` in `bootstrap/app.php`. This approach is used for the `NotFoundHttpException` handler (which catches model-binding failures and returns a clean `{"message": "ParkingLot not found."}` instead of a debug stack trace), since that exception originates from the framework rather than the domain. Domain exceptions still use `render()` for co-location; framework exceptions are handled centrally.
 
+### 2D adjacency restricted to horizontal (same row)
+
+**Chosen:** A van needs three consecutive `grid_column` values within a single `(section_id, grid_row)`.
+
+**Alternative:** Allow vertical (three rows, same column) or L-shape (graph-search across grid-adjacent cells). Rejected — vertical adjacency is physically nonsensical for nose-in parking (the car in row N+1 blocks egress for the car in row N), and L/T-shapes can't fit a single rigid van.
+
+The horizontal-only constraint also keeps the allocator a single index-ordered scan plus a constant-time check (`columns[i+2] - columns[i] == 2`), and lets the availability count stay a one-round-trip gaps-and-islands SQL by adding one column (`grid_row`) to the `PARTITION BY`.
+
 ### Gaps-and-islands SQL for van space counting
 
-**Chosen:** Three-level subquery using `ROW_NUMBER() OVER (PARTITION BY section_id ORDER BY position)` to identify runs, then `FLOOR(run_length / 3)` for non-overlapping van slots.
+**Chosen:** Three-level subquery using `ROW_NUMBER() OVER (PARTITION BY section_id, grid_row ORDER BY grid_column)` to identify runs, then `FLOOR(run_length / 3)` for non-overlapping van slots.
 
 **Alternative:** Fetch all free car spots into PHP and compute in-process. Simpler to read, but transfers all rows across the wire and does O(n) work in the application tier. The SQL approach is a single round-trip and scales to large lots without memory pressure.
 
@@ -323,14 +380,14 @@ src/
 │   └── api.php
 └── tests/
     └── Feature/
-        └── ParkingApiTest.php     26 feature tests across 4 groups
+        └── ParkingApiTest.php     35 feature tests across 4 groups
 ```
 
 ### Test Coverage Groups
 
 | Group | Scenarios |
 |---|---|
-| Golden path | Motorcycle spot, motorcycle fallback to car, car spot, van consecutive spots, unpark car, unpark van (all 3 spots freed) |
-| Rejection / errors | Car blocked when only motorcycle spots remain, van rejected on fragmented spots, van rejected when < 3 spots exist, duplicate park, unpark unknown vehicle, unpark wrong lot |
-| Validation | Missing license plate, invalid vehicle type, nonexistent lot (404), unknown vehicle in lot (404), type mismatch on re-park |
-| State & availability | Capacity totals, occupied spot counts, van space reduction on occupancy, multi-tenancy isolation, full-lot rejection |
+| Golden path | Motorcycle spot, motorcycle fallback to car, car spot, van consecutive spots (start / middle / end-of-row windows), van horizontal-run in single row, van picks only valid row when others fragmented, van section-preference (lower section\_id wins), van column-sort correctness (spots inserted in non-ascending order), unpark car, unpark van (all 3 spots freed) |
+| Rejection / errors | Car blocked when only motorcycle spots remain, van rejected on fragmented spots, van rejected when < 3 spots exist, duplicate park, unpark unknown vehicle, unpark wrong lot, van rejected at row boundary, van rejected on aisle split |
+| Validation | Missing license plate, invalid vehicle type, nonexistent lot (404), type mismatch on re-park, same plate at two different lots (multi-tenancy), park response includes grid coordinates |
+| State & availability | Capacity totals, occupied spot counts, van space reduction on occupancy, multi-tenancy isolation, full-lot rejection, availability 404 for nonexistent lot, vertical adjacency does not count as van slot |

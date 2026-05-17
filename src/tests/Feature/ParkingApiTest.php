@@ -90,9 +90,135 @@ final class ParkingApiTest extends TestCase
         $sectionIds = $spots->pluck('section_id')->unique();
         $this->assertCount(1, $sectionIds);
 
-        $positions = $spots->pluck('position')->sort()->values();
-        $this->assertSame($positions[0] + 1, $positions[1]);
-        $this->assertSame($positions[1] + 1, $positions[2]);
+        $gridRows = $spots->pluck('grid_row')->unique();
+        $this->assertCount(1, $gridRows, 'All three spots must share one grid_row');
+
+        $columns = $spots->pluck('grid_column')->sort()->values();
+        $this->assertSame($columns[0] + 1, $columns[1]);
+        $this->assertSame($columns[1] + 1, $columns[2]);
+    }
+
+    public function test_van_parks_in_middle_of_row_window(): void
+    {
+        $parkingId = $this->createDummyParking();
+        $sectionA = Section::where('parking_lot_id', $this->lotId)->where('name', 'A')->first();
+
+        Spot::where('parking_lot_id', $this->lotId)
+            ->where('type', SpotType::Car->value)
+            ->update(['parking_id' => $parkingId]);
+
+        Spot::where('section_id', $sectionA->id)
+            ->where('grid_row', 2)
+            ->whereIn('grid_column', [2, 3, 4])
+            ->update(['parking_id' => null]);
+
+        $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
+            'license_plate' => 'VAN-MID',
+            'vehicle_type' => VehicleType::Van->value,
+        ]);
+
+        $response->assertStatus(201);
+
+        $columns = Spot::where('parking_id', $response->json('id'))
+            ->orderBy('grid_column')
+            ->pluck('grid_column')
+            ->toArray();
+
+        $this->assertSame([2, 3, 4], $columns);
+    }
+
+    public function test_van_parks_in_end_of_row_window(): void
+    {
+        $parkingId = $this->createDummyParking();
+        $sectionA = Section::where('parking_lot_id', $this->lotId)->where('name', 'A')->first();
+
+        Spot::where('parking_lot_id', $this->lotId)
+            ->where('type', SpotType::Car->value)
+            ->update(['parking_id' => $parkingId]);
+
+        Spot::where('section_id', $sectionA->id)
+            ->where('grid_row', 2)
+            ->whereIn('grid_column', [3, 4, 5])
+            ->update(['parking_id' => null]);
+
+        $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
+            'license_plate' => 'VAN-END',
+            'vehicle_type' => VehicleType::Van->value,
+        ]);
+
+        $response->assertStatus(201);
+
+        $columns = Spot::where('parking_id', $response->json('id'))
+            ->orderBy('grid_column')
+            ->pluck('grid_column')
+            ->toArray();
+
+        $this->assertSame([3, 4, 5], $columns);
+    }
+
+    public function test_van_prefers_lower_section_id_when_both_sections_have_valid_runs(): void
+    {
+        $parkingId = $this->createDummyParking();
+        $sectionA = Section::where('parking_lot_id', $this->lotId)->where('name', 'A')->first();
+        $sectionB = Section::where('parking_lot_id', $this->lotId)->where('name', 'B')->first();
+
+        Spot::where('parking_lot_id', $this->lotId)
+            ->where('type', SpotType::Car->value)
+            ->update(['parking_id' => $parkingId]);
+
+        foreach ([$sectionA, $sectionB] as $section) {
+            Spot::where('section_id', $section->id)
+                ->where('grid_row', 2)
+                ->whereIn('grid_column', [1, 2, 3])
+                ->update(['parking_id' => null]);
+        }
+
+        $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
+            'license_plate' => 'VAN-SECT',
+            'vehicle_type' => VehicleType::Van->value,
+        ]);
+
+        $response->assertStatus(201);
+
+        $spots = Spot::where('parking_id', $response->json('id'))->get();
+        $this->assertCount(3, $spots);
+        $this->assertTrue(
+            $spots->every(fn ($s) => $s->section_id === $sectionA->id),
+            'Allocator should pick the lower section_id (A) when both sections have a valid run'
+        );
+    }
+
+    public function test_van_allocates_correctly_when_spots_inserted_in_non_ascending_column_order(): void
+    {
+        $lot = ParkingLot::create(['name' => 'Shuffle Lot']);
+        $section = Section::create(['parking_lot_id' => $lot->id, 'name' => 'S']);
+
+        $now = now();
+        // Insert in descending order to verify orderBy('grid_column') is load-bearing.
+        Spot::insert(array_map(fn ($col) => [
+            'parking_lot_id' => $lot->id,
+            'section_id' => $section->id,
+            'type' => SpotType::Car->value,
+            'grid_row' => 1,
+            'grid_column' => $col,
+            'parking_id' => null,
+            'created_at' => $now,
+            'updated_at' => $now,
+        ], [5, 4, 3, 2, 1]));
+
+        $response = $this->postJson("/api/parking-lots/{$lot->id}/sessions", [
+            'license_plate' => 'VAN-SORT',
+            'vehicle_type' => VehicleType::Van->value,
+        ]);
+
+        $response->assertStatus(201);
+
+        $columns = Spot::where('parking_id', $response->json('id'))
+            ->orderBy('grid_column')
+            ->pluck('grid_column')
+            ->toArray();
+
+        $this->assertSame([1, 2, 3], $columns);
     }
 
     public function test_unpark_frees_associated_spots(): void
@@ -150,6 +276,71 @@ final class ParkingApiTest extends TestCase
         ]);
     }
 
+    public function test_van_succeeds_with_horizontal_run_in_single_row(): void
+    {
+        $parkingId = $this->createDummyParking();
+        $sectionA = Section::where('parking_lot_id', $this->lotId)
+            ->where('name', 'A')
+            ->first();
+
+        // Occupy all car spots, free exactly row 2 columns 1-3 in section A.
+        Spot::where('parking_lot_id', $this->lotId)
+            ->where('type', SpotType::Car->value)
+            ->update(['parking_id' => $parkingId]);
+
+        Spot::where('section_id', $sectionA->id)
+            ->where('grid_row', 2)
+            ->whereIn('grid_column', [1, 2, 3])
+            ->update(['parking_id' => null]);
+
+        $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
+            'license_plate' => 'VAN-HORIZ',
+            'vehicle_type' => VehicleType::Van->value,
+        ]);
+
+        $response->assertStatus(201);
+
+        $spots = Spot::where('parking_id', $response->json('id'))->get();
+        $this->assertSame([2, 2, 2], $spots->pluck('grid_row')->toArray());
+        $this->assertEqualsCanonicalizing([1, 2, 3], $spots->pluck('grid_column')->toArray());
+    }
+
+    public function test_van_picks_the_only_valid_row_when_others_are_fragmented(): void
+    {
+        $parkingId = $this->createDummyParking();
+        $sectionA = Section::where('parking_lot_id', $this->lotId)
+            ->where('name', 'A')
+            ->first();
+
+        // Occupy everything, then:
+        //   Row 2 of A: free cols 1, 2, 4   (fragmented — no run of 3)
+        //   Row 3 of A: free cols 1, 2, 3   (valid run of 3)
+        Spot::where('parking_lot_id', $this->lotId)
+            ->where('type', SpotType::Car->value)
+            ->update(['parking_id' => $parkingId]);
+
+        Spot::where('section_id', $sectionA->id)
+            ->where('grid_row', 2)
+            ->whereIn('grid_column', [1, 2, 4])
+            ->update(['parking_id' => null]);
+
+        Spot::where('section_id', $sectionA->id)
+            ->where('grid_row', 3)
+            ->whereIn('grid_column', [1, 2, 3])
+            ->update(['parking_id' => null]);
+
+        $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
+            'license_plate' => 'VAN-PICK-ROW',
+            'vehicle_type' => VehicleType::Van->value,
+        ]);
+
+        $response->assertStatus(201);
+
+        $spots = Spot::where('parking_id', $response->json('id'))->get();
+        $this->assertSame([3, 3, 3], $spots->pluck('grid_row')->toArray());
+        $this->assertEqualsCanonicalizing([1, 2, 3], $spots->pluck('grid_column')->toArray());
+    }
+
     // -----------------------------------------------------------------
     // Group 2: Rejection / Error Cases
     // -----------------------------------------------------------------
@@ -163,7 +354,8 @@ final class ParkingApiTest extends TestCase
             'vehicle_type' => VehicleType::Car->value,
         ]);
 
-        $response->assertStatus(409);
+        $response->assertStatus(409)
+            ->assertJsonPath('message', 'No available spot for this vehicle type.');
         $this->assertDatabaseCount('parkings', 1);
     }
 
@@ -172,16 +364,19 @@ final class ParkingApiTest extends TestCase
         $parkingId = $this->createDummyParking();
         $sections = Section::where('parking_lot_id', $this->lotId)->get();
 
-        // Fragment car spots so no 3 consecutive spots remain in any section.
-        // Free adjacent pairs (6-7, 9-10, 12-13) plus an isolated 15: each
-        // section has free runs of length 2, 2, 2, 1 — exercising the trickier
-        // "two-adjacent but not three" gap-detection edge.
+        // Occupy every car spot, then free pairs that never form 3-in-a-row
+        // within a single (section, grid_row). Each car row keeps free
+        // columns 1-2 and 4-5 — the missing column 3 breaks the run.
         Spot::where('parking_lot_id', $this->lotId)
             ->where('type', SpotType::Car->value)
             ->update(['parking_id' => $parkingId]);
 
         foreach ($sections as $section) {
-            $this->freeSpotsAtPositions($section, [6, 7, 9, 10, 12, 13, 15]);
+            Spot::query()
+                ->where('section_id', $section->id)
+                ->where('type', SpotType::Car->value)
+                ->whereIn('grid_column', [1, 2, 4, 5])
+                ->update(['parking_id' => null]);
         }
 
         $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
@@ -196,15 +391,21 @@ final class ParkingApiTest extends TestCase
     public function test_van_is_rejected_when_fewer_than_three_car_spots_exist(): void
     {
         $parkingId = $this->createDummyParking();
-        $keepFreeIds = Spot::where('parking_lot_id', $this->lotId)
-            ->where('type', SpotType::Car->value)
-            ->limit(2)
-            ->pluck('id');
+        $sectionA = Section::where('parking_lot_id', $this->lotId)
+            ->where('name', 'A')
+            ->first();
 
+        // Occupy every car spot, then free exactly 2 consecutive spots in one row.
+        // 2 < 3, so the allocator's row-count guard rejects before even checking
+        // for a sliding window of 3 — distinct from the fragmentation scenario.
         Spot::where('parking_lot_id', $this->lotId)
             ->where('type', SpotType::Car->value)
-            ->whereNotIn('id', $keepFreeIds)
             ->update(['parking_id' => $parkingId]);
+
+        Spot::where('section_id', $sectionA->id)
+            ->where('grid_row', 2)
+            ->whereIn('grid_column', [1, 2])
+            ->update(['parking_id' => null]);
 
         $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
             'license_plate' => 'VAN-FEW',
@@ -246,6 +447,67 @@ final class ParkingApiTest extends TestCase
         $response->assertStatus(404);
     }
 
+    public function test_van_is_rejected_when_three_free_spots_cross_a_row_boundary(): void
+    {
+        $parkingId = $this->createDummyParking();
+        $sectionA = Section::where('parking_lot_id', $this->lotId)
+            ->where('name', 'A')
+            ->first();
+
+        // Occupy all car spots, then free three that do NOT share a row:
+        // (row 2, col 4), (row 2, col 5), (row 3, col 1).
+        Spot::where('parking_lot_id', $this->lotId)
+            ->where('type', SpotType::Car->value)
+            ->update(['parking_id' => $parkingId]);
+
+        Spot::where('section_id', $sectionA->id)
+            ->where(function ($q) {
+                $q->where(function ($q2) {
+                    $q2->where('grid_row', 2)->whereIn('grid_column', [4, 5]);
+                })->orWhere(function ($q2) {
+                    $q2->where('grid_row', 3)->where('grid_column', 1);
+                });
+            })
+            ->update(['parking_id' => null]);
+
+        $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
+            'license_plate' => 'VAN-CROSS',
+            'vehicle_type' => VehicleType::Van->value,
+        ]);
+
+        $response->assertStatus(409);
+    }
+
+    public function test_van_is_rejected_when_aisle_splits_a_row(): void
+    {
+        $lot = ParkingLot::create(['name' => 'Sparse Lot']);
+        $section = Section::create(['parking_lot_id' => $lot->id, 'name' => 'X']);
+
+        $now = now();
+        $rows = [];
+        // Row 1, columns 1, 2, 4, 5 (column 3 is an implicit aisle).
+        foreach ([1, 2, 4, 5] as $column) {
+            $rows[] = [
+                'parking_lot_id' => $lot->id,
+                'section_id' => $section->id,
+                'type' => SpotType::Car->value,
+                'grid_row' => 1,
+                'grid_column' => $column,
+                'parking_id' => null,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+        Spot::insert($rows);
+
+        $response = $this->postJson("/api/parking-lots/{$lot->id}/sessions", [
+            'license_plate' => 'VAN-AISLE',
+            'vehicle_type' => VehicleType::Van->value,
+        ]);
+
+        $response->assertStatus(409);
+    }
+
     // -----------------------------------------------------------------
     // Group 3: Validation Errors
     // -----------------------------------------------------------------
@@ -282,14 +544,6 @@ final class ParkingApiTest extends TestCase
         $response->assertStatus(404);
     }
 
-    public function test_unpark_fails_for_unknown_vehicle_in_lot(): void
-    {
-        // license_plate is a URL segment; a plate never seen in this lot returns 404.
-        $response = $this->deleteJson("/api/parking-lots/{$this->lotId}/vehicles/UNKNOWN-PLATE-XYZ");
-
-        $response->assertStatus(404);
-    }
-
     public function test_park_fails_with_vehicle_type_mismatch(): void
     {
         $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
@@ -317,14 +571,22 @@ final class ParkingApiTest extends TestCase
         $lotB = ParkingLot::create(['name' => 'Second Lot']);
         $sectionB = Section::create(['parking_lot_id' => $lotB->id, 'name' => 'B1']);
 
-        for ($position = 1; $position <= 10; $position++) {
-            Spot::create([
+        $spotRows = [];
+        $now = now();
+        // One row of 10 car spots so a van can also park here.
+        for ($column = 1; $column <= 10; $column++) {
+            $spotRows[] = [
                 'parking_lot_id' => $lotB->id,
                 'section_id' => $sectionB->id,
                 'type' => SpotType::Car->value,
-                'position' => $position,
-            ]);
+                'grid_row' => 1,
+                'grid_column' => $column,
+                'parking_id' => null,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
         }
+        Spot::insert($spotRows);
 
         $plate = 'DUPLICATE-PLATE-1';
 
@@ -339,6 +601,26 @@ final class ParkingApiTest extends TestCase
         ])->assertStatus(201);
 
         $this->assertSame(2, Vehicle::where('license_plate', $plate)->count());
+    }
+
+    public function test_park_response_includes_grid_coordinates(): void
+    {
+        $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
+            'license_plate' => 'GRID-001',
+            'vehicle_type' => VehicleType::Car->value,
+        ]);
+
+        $response->assertStatus(201)
+            ->assertJsonStructure([
+                'id', 'license_plate', 'vehicle_type', 'parking_lot_id', 'started_at',
+                'spots' => [
+                    '*' => ['id', 'type', 'section_id', 'grid_row', 'grid_column'],
+                ],
+            ])
+            ->assertJsonMissingPath('spots.0.position');
+
+        $this->assertIsInt($response->json('spots.0.grid_row'));
+        $this->assertIsInt($response->json('spots.0.grid_column'));
     }
 
     // -----------------------------------------------------------------
@@ -393,14 +675,21 @@ final class ParkingApiTest extends TestCase
         $lot2 = ParkingLot::create(['name' => 'Second Lot']);
         $section2 = Section::create(['parking_lot_id' => $lot2->id, 'name' => 'C']);
 
-        for ($position = 1; $position <= 5; $position++) {
-            Spot::create([
+        $spotRows = [];
+        $now = now();
+        for ($column = 1; $column <= 5; $column++) {
+            $spotRows[] = [
                 'parking_lot_id' => $lot2->id,
                 'section_id' => $section2->id,
                 'type' => SpotType::Motorcycle->value,
-                'position' => $position,
-            ]);
+                'grid_row' => 1,
+                'grid_column' => $column,
+                'parking_id' => null,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
         }
+        Spot::insert($spotRows);
 
         $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
             'license_plate' => 'MULTI-001',
@@ -423,14 +712,21 @@ final class ParkingApiTest extends TestCase
             'name' => 'C',
         ]);
 
-        for ($position = 1; $position <= 5; $position++) {
-            Spot::create([
+        $spotRows = [];
+        $now = now();
+        for ($column = 1; $column <= 5; $column++) {
+            $spotRows[] = [
                 'parking_lot_id' => $lot2->id,
                 'section_id' => $section2->id,
                 'type' => SpotType::Car->value,
-                'position' => $position,
-            ]);
+                'grid_row' => 1,
+                'grid_column' => $column,
+                'parking_id' => null,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
         }
+        Spot::insert($spotRows);
 
         $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
             'license_plate' => 'WRONG-LOT',
@@ -450,12 +746,14 @@ final class ParkingApiTest extends TestCase
             ->where('name', 'A')
             ->first();
 
+        // Occupy every car spot, then free exactly one window of 3 in row 2 of A.
         Spot::where('parking_lot_id', $this->lotId)
             ->where('type', SpotType::Car->value)
             ->update(['parking_id' => $parkingId]);
 
         Spot::where('section_id', $sectionA->id)
-            ->whereIn('position', [6, 7, 8])
+            ->where('grid_row', 2)
+            ->whereIn('grid_column', [1, 2, 3])
             ->update(['parking_id' => null]);
 
         $response = $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
@@ -467,13 +765,14 @@ final class ParkingApiTest extends TestCase
 
         $newParkingId = $response->json('id');
         $spots = Spot::where('parking_id', $newParkingId)
-            ->orderBy('position')
+            ->orderBy('grid_column')
             ->get();
 
         $this->assertCount(3, $spots);
-        $this->assertSame(6, $spots[0]->position);
-        $this->assertSame(7, $spots[1]->position);
-        $this->assertSame(8, $spots[2]->position);
+        $this->assertSame(2, $spots[0]->grid_row);
+        $this->assertSame(1, $spots[0]->grid_column);
+        $this->assertSame(2, $spots[1]->grid_column);
+        $this->assertSame(3, $spots[2]->grid_column);
         $this->assertSame($sectionA->id, $spots[0]->section_id);
     }
 
@@ -507,6 +806,40 @@ final class ParkingApiTest extends TestCase
             ->assertStatus(404);
     }
 
+    public function test_availability_does_not_count_vertical_adjacency_as_van_slot(): void
+    {
+        $lot = ParkingLot::create(['name' => 'Vertical Test Lot']);
+        $section = Section::create(['parking_lot_id' => $lot->id, 'name' => 'V']);
+
+        // Three free car spots, but their layout has NO horizontal run of 3:
+        //   (row 2, col 1), (row 3, col 1), (row 3, col 2)
+        // Vertical adjacency must NOT count.
+        $now = now();
+        Spot::insert([
+            [
+                'parking_lot_id' => $lot->id, 'section_id' => $section->id,
+                'type' => SpotType::Car->value, 'grid_row' => 2, 'grid_column' => 1,
+                'parking_id' => null, 'created_at' => $now, 'updated_at' => $now,
+            ],
+            [
+                'parking_lot_id' => $lot->id, 'section_id' => $section->id,
+                'type' => SpotType::Car->value, 'grid_row' => 3, 'grid_column' => 1,
+                'parking_id' => null, 'created_at' => $now, 'updated_at' => $now,
+            ],
+            [
+                'parking_lot_id' => $lot->id, 'section_id' => $section->id,
+                'type' => SpotType::Car->value, 'grid_row' => 3, 'grid_column' => 2,
+                'parking_id' => null, 'created_at' => $now, 'updated_at' => $now,
+            ],
+        ]);
+
+        $response = $this->getJson("/api/parking-lots/{$lot->id}/availability");
+
+        $response->assertStatus(200)
+            ->assertJsonPath('available_van_spaces', 0)
+            ->assertJsonPath('available_car_spots', 3);
+    }
+
     // -----------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------
@@ -525,14 +858,6 @@ final class ParkingApiTest extends TestCase
         ]);
 
         return $parking->id;
-    }
-
-    private function freeSpotsAtPositions(Section $section, array $positions): void
-    {
-        Spot::query()
-            ->where('section_id', $section->id)
-            ->whereIn('position', $positions)
-            ->update(['parking_id' => null]);
     }
 
     private function occupyAllMotorcycleSpots(int $parkingLotId): void

@@ -20,7 +20,7 @@ final class ParkVehicleRequest extends FormRequest
     {
         return [
             'license_plate' => ['required', 'string', 'max:255'],
-            'vehicle_type' => ['required', 'string', Rule::enum(VehicleType::class)],
+            'vehicle_type' => ['required', Rule::enum(VehicleType::class)],
         ];
     }
 
