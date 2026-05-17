@@ -5,8 +5,11 @@ namespace App\Http\Resources;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
-class ParkingResource extends JsonResource
+final class ParkingResource extends JsonResource
 {
+    /**
+     * @return array<string, mixed>
+     */
     public function toArray(Request $request): array
     {
         return [
@@ -20,7 +23,7 @@ class ParkingResource extends JsonResource
                 'type' => $spot->type->value,
                 'section_id' => $spot->section_id,
                 'position' => $spot->position,
-            ]),
+            ])->values(),
         ];
     }
 }

@@ -9,20 +9,20 @@ use App\Domains\Parking\Models\Spot;
 use App\Domains\Parking\Models\Vehicle;
 use Illuminate\Support\Facades\DB;
 
-class UnparkVehicle
+final class UnparkVehicle
 {
     public function handle(UnparkVehicleData $data): void
     {
-        $vehicle = Vehicle::query()
-            ->where('parking_lot_id', $data->parkingLotId)
-            ->where('license_plate', $data->licensePlate)
-            ->first();
+        DB::transaction(function () use ($data): void {
+            $vehicle = Vehicle::query()
+                ->where('parking_lot_id', $data->parkingLotId)
+                ->where('license_plate', $data->licensePlate)
+                ->first();
 
-        if (! $vehicle) {
-            throw new VehicleNotParkedException;
-        }
+            if (! $vehicle) {
+                throw new VehicleNotParkedException;
+            }
 
-        DB::transaction(function () use ($data, $vehicle) {
             $parking = ParkingSession::query()
                 ->where('vehicle_id', $vehicle->id)
                 ->where('parking_lot_id', $data->parkingLotId)

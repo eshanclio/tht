@@ -128,7 +128,7 @@ spots
   id
   parking_lot_id (FK → parking_lots)  ← denormalized from section (see Assumptions)
   section_id (FK → sections)
-  type       ENUM('motorcycle', 'car')
+  type       VARCHAR ('motorcycle' or 'car', enforced at the application layer by SpotType enum casts)
   position   INTEGER                  ← ordinal within a section; consecutive = position differs by 1
   parking_id FK → parkings (nullable) ← NULL = available, non-null = occupied
 
@@ -203,10 +203,9 @@ SELECT COALESCE(SUM(FLOOR(run_length / 3)), 0) FROM level2
 
 Cars and motorcycles use only `SELECT ... FOR UPDATE` — single-spot allocation is inherently atomic.
 
-**Duplicate-session prevention** operates at two layers:
+**Duplicate-session prevention** is enforced at the database layer:
 
-1. **Application check:** `ParkVehicle` selects any active `ParkingSession` for the vehicle with `lockForUpdate()` before proceeding. If one exists, it throws `VehicleAlreadyParkedException` immediately.
-2. **Database constraint:** `UNIQUE INDEX parkings_active_vehicle_unique ON parkings(vehicle_id) WHERE ended_at IS NULL`. If two concurrent requests both pass the application check (possible in a race), one will hit a `UniqueConstraintViolationException` on insert, which `ParkVehicle` catches and re-raises as `VehicleAlreadyParkedException`.
+`UNIQUE INDEX parkings_active_vehicle_unique ON parkings(vehicle_id) WHERE ended_at IS NULL` guarantees at most one active session per vehicle. `ParkVehicle` does not perform an application-level pre-check — it relies entirely on this partial unique index. If a concurrent request attempts to insert a second active session for the same vehicle, the `INSERT` raises `UniqueConstraintViolationException`, which `ParkVehicle` catches inside the transaction (rolling back the vehicle upsert and spot reservation) and rethrows as `VehicleAlreadyParkedException` → `409`. Collapsing duplicate prevention to a single layer avoids an extra `SELECT ... FOR UPDATE` round-trip on every park request and removes a class of TOCTOU races that any application-level check would carry.
 
 ### Multi-Tenancy
 
@@ -230,7 +229,7 @@ Cars and motorcycles use only `SELECT ... FOR UPDATE` — single-spot allocation
 
 **One active session per vehicle per lot.** A vehicle can have parallel active sessions at different lots (multi-tenancy), but attempting a second active session at the same lot returns `409`.
 
-**Vehicle type is immutable after first park.** `firstOrCreate` records the vehicle type on first contact. A subsequent request presenting the same plate with a different type raises `VehicleTypeMismatchException` (409). This prevents accidental reclassification caused by a misconfigured camera system.
+**Vehicle type is immutable after first park.** `createOrFirst` records the vehicle type on first contact. A subsequent request presenting the same plate with a different type raises `VehicleTypeMismatchException` (409). This prevents accidental reclassification caused by a misconfigured camera system.
 
 **Fixed lot structure.** Dynamic lot/section/spot creation is not exposed via the API. The seeder populates one fixed lot.
 

@@ -13,20 +13,20 @@ use App\Domains\Parking\Services\SpotAllocator;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 
-class ParkVehicle
+final class ParkVehicle
 {
     // Manual namespace for pg_advisory_xact_lock. Bump if other features
     // start using advisory locks and risk colliding on the same (ns, id) key.
-    private const VAN_LOCK_NAMESPACE = 1;
+    private const int VAN_LOCK_NAMESPACE = 1;
 
     public function __construct(
-        private SpotAllocator $spotAllocator,
+        private readonly SpotAllocator $spotAllocator,
     ) {}
 
     public function handle(ParkVehicleData $data): ParkingSession
     {
         try {
-            return DB::transaction(function () use ($data) {
+            return DB::transaction(function () use ($data): ParkingSession {
                 $vehicle = Vehicle::createOrFirst(
                     [
                         'parking_lot_id' => $data->parkingLotId,
@@ -61,6 +61,8 @@ class ParkVehicle
                 // Duplicate active parkings are prevented by the
                 // `parkings_active_vehicle_unique` partial index; a concurrent
                 // INSERT throws UniqueConstraintViolationException, caught below.
+                // The entire transaction (vehicle upsert + spot reservation) is
+                // rolled back when that happens.
                 $parking = ParkingSession::create([
                     'parking_lot_id' => $data->parkingLotId,
                     'vehicle_id' => $vehicle->id,

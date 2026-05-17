@@ -5,8 +5,11 @@ namespace App\Http\Resources;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 
-class AvailabilityResource extends JsonResource
+final class AvailabilityResource extends JsonResource
 {
+    /**
+     * @return array<string, int>
+     */
     public function toArray(Request $request): array
     {
         return [

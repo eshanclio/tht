@@ -8,18 +8,13 @@ use App\Domains\Parking\Models\Section;
 use App\Domains\Parking\Models\Spot;
 use Illuminate\Database\Seeder;
 
-class ParkingLotSeeder extends Seeder
+final class ParkingLotSeeder extends Seeder
 {
-    /**
-     * Seed the application's database with a fixed parking lot structure.
-     */
     public function run(): void
     {
         $lot = ParkingLot::create(['name' => 'Main Lot']);
 
-        $sections = ['A', 'B'];
-
-        foreach ($sections as $sectionName) {
+        foreach (['A', 'B'] as $sectionName) {
             $section = Section::create([
                 'parking_lot_id' => $lot->id,
                 'name' => $sectionName,

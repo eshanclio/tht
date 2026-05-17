@@ -6,10 +6,10 @@ use App\Domains\Parking\Data\LotAvailabilityData;
 use App\Domains\Parking\Services\SpotAllocator;
 use Illuminate\Support\Facades\DB;
 
-class GetLotAvailability
+final class GetLotAvailability
 {
     public function __construct(
-        private SpotAllocator $spotAllocator,
+        private readonly SpotAllocator $spotAllocator,
     ) {}
 
     public function handle(int $parkingLotId): LotAvailabilityData

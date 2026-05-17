@@ -7,7 +7,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 
-class NoAvailableSpotException extends Exception
+final class NoAvailableSpotException extends Exception
 {
     public function __construct(string $message = 'No available spot for this vehicle type.')
     {

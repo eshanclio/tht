@@ -8,7 +8,7 @@ use App\Domains\Parking\Exceptions\NoAvailableSpotException;
 use App\Domains\Parking\Models\Spot;
 use Illuminate\Support\Facades\DB;
 
-class SpotAllocator
+final class SpotAllocator
 {
     /**
      * @return array<int> Spot IDs to allocate.
@@ -122,6 +122,7 @@ class SpotAllocator
         $locked = Spot::query()
             ->whereIn('id', $winningIds)
             ->whereNull('parking_id')
+            ->orderBy('id')
             ->lockForUpdate()
             ->get();
 

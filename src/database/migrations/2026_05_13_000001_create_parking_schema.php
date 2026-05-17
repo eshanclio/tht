@@ -46,7 +46,6 @@ return new class extends Migration
 
             $table->unique(['section_id', 'position']);
             $table->index('parking_lot_id');
-            $table->index('parking_id');
         });
 
         // Vehicles are scoped per lot so the same plate can independently exist
@@ -94,6 +93,12 @@ return new class extends Migration
 
         // Partial indexes: each index is scoped to the rows the allocator
         // queries against, keeping them small and selective.
+        // `parking_id` is NULL for every free spot, so a partial index keeps
+        // the unpark lookup (filter by parking_id) lean.
+        DB::statement(
+            'CREATE INDEX spots_parking_id_idx ON spots (parking_id)'
+            .' WHERE parking_id IS NOT NULL'
+        );
         DB::statement(
             'CREATE INDEX spots_available_car_section_idx ON spots (section_id, position)'
             ." WHERE type = 'car' AND parking_id IS NULL"

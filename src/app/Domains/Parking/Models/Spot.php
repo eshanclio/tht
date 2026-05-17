@@ -6,7 +6,7 @@ use App\Domains\Parking\Data\SpotType;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
-class Spot extends Model
+final class Spot extends Model
 {
     protected $fillable = ['parking_lot_id', 'section_id', 'type', 'position', 'parking_id'];
 
@@ -14,7 +14,6 @@ class Spot extends Model
     {
         return [
             'type' => SpotType::class,
-            'parking_id' => 'integer',
         ];
     }
 

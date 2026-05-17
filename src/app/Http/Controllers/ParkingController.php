@@ -12,13 +12,14 @@ use App\Http\Requests\ParkVehicleRequest;
 use App\Http\Resources\AvailabilityResource;
 use App\Http\Resources\ParkingResource;
 use Illuminate\Http\JsonResponse;
+use Symfony\Component\HttpFoundation\Response;
 
-class ParkingController
+final class ParkingController
 {
     public function park(ParkVehicleRequest $request, ParkingLot $parkingLot, ParkVehicle $action): JsonResponse
     {
         $data = new ParkVehicleData(
-            licensePlate: $request->input('license_plate'),
+            licensePlate: $request->string('license_plate')->toString(),
             vehicleType: $request->vehicleType(),
             parkingLotId: $parkingLot->id,
         );
@@ -27,7 +28,7 @@ class ParkingController
 
         return (new ParkingResource($parking))
             ->response()
-            ->setStatusCode(201);
+            ->setStatusCode(Response::HTTP_CREATED);
     }
 
     public function unpark(ParkingLot $parkingLot, string $licensePlate, UnparkVehicle $action): JsonResponse
@@ -39,7 +40,7 @@ class ParkingController
 
         $action->handle($data);
 
-        return response()->json(null, 204);
+        return response()->json(null, Response::HTTP_NO_CONTENT);
     }
 
     public function availability(ParkingLot $parkingLot, GetLotAvailability $action): JsonResponse

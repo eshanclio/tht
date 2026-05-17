@@ -7,7 +7,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 
-class VehicleAlreadyParkedException extends Exception
+final class VehicleAlreadyParkedException extends Exception
 {
     public function __construct(string $message = 'Vehicle is already parked.')
     {

@@ -2,7 +2,7 @@
 
 namespace App\Domains\Parking\Data;
 
-readonly class UnparkVehicleData
+final readonly class UnparkVehicleData
 {
     public function __construct(
         public string $licensePlate,

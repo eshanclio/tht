@@ -6,8 +6,9 @@ use App\Domains\Parking\Data\VehicleType;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use RuntimeException;
+use Symfony\Component\HttpFoundation\Response;
 
-class VehicleTypeMismatchException extends RuntimeException
+final class VehicleTypeMismatchException extends RuntimeException
 {
     public function __construct(
         public readonly VehicleType $recordedType,
@@ -24,6 +25,6 @@ class VehicleTypeMismatchException extends RuntimeException
             'message' => $this->getMessage(),
             'recorded_type' => $this->recordedType->value,
             'requested_type' => $this->requestedType->value,
-        ], 409);
+        ], Response::HTTP_CONFLICT);
     }
 }

@@ -13,7 +13,7 @@ use Database\Seeders\ParkingLotSeeder;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
 
-class ParkingApiTest extends TestCase
+final class ParkingApiTest extends TestCase
 {
     use RefreshDatabase;
 

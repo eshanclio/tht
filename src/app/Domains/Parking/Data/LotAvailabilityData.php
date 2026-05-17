@@ -2,7 +2,7 @@
 
 namespace App\Domains\Parking\Data;
 
-readonly class LotAvailabilityData
+final readonly class LotAvailabilityData
 {
     public function __construct(
         public int $totalMotorcycleSpots,
