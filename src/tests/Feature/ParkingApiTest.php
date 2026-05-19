@@ -8,9 +8,11 @@ use App\Domains\Parking\Models\ParkingLot;
 use App\Domains\Parking\Models\ParkingSession;
 use App\Domains\Parking\Models\Section;
 use App\Domains\Parking\Models\Spot;
+use App\Domains\Parking\Models\VanWindow;
 use App\Domains\Parking\Models\Vehicle;
 use Database\Seeders\ParkingLotSeeder;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Artisan;
 use Tests\TestCase;
 
 final class ParkingApiTest extends TestCase
@@ -205,6 +207,31 @@ final class ParkingApiTest extends TestCase
             'created_at' => $now,
             'updated_at' => $now,
         ], [5, 4, 3, 2, 1]));
+
+        $insertedSpots = Spot::where('section_id', $section->id)
+            ->orderBy('grid_column')
+            ->get(['id', 'parking_lot_id', 'section_id', 'grid_row', 'grid_column']);
+
+        $windowRows = [];
+        for ($i = 0; $i + 2 < $insertedSpots->count(); $i++) {
+            $l = $insertedSpots[$i];
+            $m = $insertedSpots[$i + 1];
+            $r = $insertedSpots[$i + 2];
+            $windowRows[] = [
+                'parking_lot_id' => $l->parking_lot_id,
+                'section_id' => $l->section_id,
+                'grid_row' => $l->grid_row,
+                'start_column' => $l->grid_column,
+                'car_spot_left_id' => $l->id,
+                'car_spot_mid_id' => $m->id,
+                'car_spot_right_id' => $r->id,
+                'parking_id' => null,
+                'blocked_count' => 0,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+        VanWindow::insert($windowRows);
 
         $response = $this->postJson("/api/parking-lots/{$lot->id}/sessions", [
             'license_plate' => 'VAN-SORT',
@@ -588,6 +615,30 @@ final class ParkingApiTest extends TestCase
         }
         Spot::insert($spotRows);
 
+        $insertedSpotsB = Spot::where('section_id', $sectionB->id)
+            ->orderBy('grid_column')
+            ->get(['id', 'parking_lot_id', 'section_id', 'grid_row', 'grid_column']);
+        $windowRowsB = [];
+        for ($i = 0; $i + 2 < $insertedSpotsB->count(); $i++) {
+            $l = $insertedSpotsB[$i];
+            $m = $insertedSpotsB[$i + 1];
+            $r = $insertedSpotsB[$i + 2];
+            $windowRowsB[] = [
+                'parking_lot_id' => $l->parking_lot_id,
+                'section_id' => $l->section_id,
+                'grid_row' => $l->grid_row,
+                'start_column' => $l->grid_column,
+                'car_spot_left_id' => $l->id,
+                'car_spot_mid_id' => $m->id,
+                'car_spot_right_id' => $r->id,
+                'parking_id' => null,
+                'blocked_count' => 0,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+        VanWindow::insert($windowRowsB);
+
         $plate = 'DUPLICATE-PLATE-1';
 
         $this->postJson("/api/parking-lots/{$this->lotId}/sessions", [
@@ -874,5 +925,376 @@ final class ParkingApiTest extends TestCase
         Spot::where('parking_lot_id', $parkingLotId)
             ->where('type', SpotType::Car->value)
             ->update(['parking_id' => $parkingId]);
+    }
+
+    // -----------------------------------------------------------------
+    // Group A: Seeder integrity
+    // -----------------------------------------------------------------
+
+    public function test_seeder_creates_expected_van_windows_count(): void
+    {
+        // Fresh seed already ran via RefreshDatabase. Verify materialization.
+        $count = \App\Domains\Parking\Models\VanWindow::count();
+        $this->assertSame(12, $count, '4 car rows × 3 windows each = 12 van_windows');
+
+        $allFree = \App\Domains\Parking\Models\VanWindow::whereNull('parking_id')
+            ->where('blocked_count', 0)
+            ->count();
+        $this->assertSame(12, $allFree, 'All windows start with parking_id NULL and blocked_count 0');
+    }
+
+    public function test_seeder_van_windows_reference_correct_car_spots(): void
+    {
+        $windows = \App\Domains\Parking\Models\VanWindow::with(['carSpotLeft', 'carSpotMid', 'carSpotRight'])
+            ->get();
+
+        foreach ($windows as $w) {
+            $this->assertSame($w->section_id, $w->carSpotLeft->section_id);
+            $this->assertSame($w->section_id, $w->carSpotMid->section_id);
+            $this->assertSame($w->section_id, $w->carSpotRight->section_id);
+
+            $this->assertSame($w->grid_row, $w->carSpotLeft->grid_row);
+            $this->assertSame($w->grid_row, $w->carSpotMid->grid_row);
+            $this->assertSame($w->grid_row, $w->carSpotRight->grid_row);
+
+            $this->assertSame($w->start_column,     $w->carSpotLeft->grid_column);
+            $this->assertSame($w->start_column + 1, $w->carSpotMid->grid_column);
+            $this->assertSame($w->start_column + 2, $w->carSpotRight->grid_column);
+
+            $this->assertSame(\App\Domains\Parking\Data\SpotType::Car, $w->carSpotLeft->type);
+            $this->assertSame(\App\Domains\Parking\Data\SpotType::Car, $w->carSpotMid->type);
+            $this->assertSame(\App\Domains\Parking\Data\SpotType::Car, $w->carSpotRight->type);
+        }
+    }
+
+    public function test_seeder_is_idempotent(): void
+    {
+        $before = \App\Domains\Parking\Models\VanWindow::count();
+        Artisan::call('db:seed');
+        $after = \App\Domains\Parking\Models\VanWindow::count();
+
+        $this->assertSame($before, $after, 'db:seed twice must not duplicate van_windows rows');
+    }
+
+    // -----------------------------------------------------------------
+    // Group B: blocked_count invariant
+    // -----------------------------------------------------------------
+
+    /**
+     * Asserts the blocked_count invariant for every van_windows row:
+     *
+     *   W.blocked_count == count(s in W's 3 underlying car spots:
+     *                            s.parking_id IS NOT NULL
+     *                            AND s.parking_id !== W.parking_id)
+     *
+     * When W is unoccupied (W.parking_id NULL), this collapses to "count of
+     * W's spots that are taken." When W is occupied by a van, all 3 spots
+     * carry that van's session id and the count is 0.
+     */
+    private function assertBlockedCountInvariant(): void
+    {
+        $windows = \App\Domains\Parking\Models\VanWindow::with([
+            'carSpotLeft', 'carSpotMid', 'carSpotRight',
+        ])->get();
+
+        foreach ($windows as $w) {
+            $expected = 0;
+            foreach ([$w->carSpotLeft, $w->carSpotMid, $w->carSpotRight] as $spot) {
+                if ($spot->parking_id !== null && $spot->parking_id !== $w->parking_id) {
+                    $expected++;
+                }
+            }
+            $this->assertSame(
+                $expected,
+                $w->blocked_count,
+                "Window id={$w->id} (section={$w->section_id}, row={$w->grid_row}, start_col={$w->start_column}): expected blocked_count={$expected}, got {$w->blocked_count}"
+            );
+        }
+    }
+
+    public function test_blocked_count_invariant_holds_after_arbitrary_park_unpark_sequence(): void
+    {
+        // Fixed-seed scenario for reproducibility.
+        $lot = \App\Domains\Parking\Models\ParkingLot::first();
+        $base = "/api/parking-lots/{$lot->id}";
+
+        $operations = [
+            ['park', 'car',        'CAR-001'],
+            ['park', 'van',        'VAN-001'],
+            ['park', 'motorcycle', 'MC-001'],
+            ['park', 'car',        'CAR-002'],
+            ['park', 'van',        'VAN-002'],
+            ['unpark', null,       'VAN-001'],
+            ['park', 'car',        'CAR-003'],
+            ['unpark', null,       'CAR-002'],
+            ['park', 'van',        'VAN-003'],
+            ['unpark', null,       'VAN-002'],
+        ];
+
+        foreach ($operations as [$op, $type, $plate]) {
+            if ($op === 'park') {
+                $this->postJson("{$base}/sessions", [
+                    'license_plate' => $plate,
+                    'vehicle_type' => $type,
+                ])->assertStatus(201);
+            } else {
+                $this->deleteJson("{$base}/vehicles/{$plate}")->assertStatus(204);
+            }
+            $this->assertBlockedCountInvariant();
+        }
+    }
+
+    public function test_motorcycle_fallback_to_car_spot_bumps_blocked_count(): void
+    {
+        $lot = \App\Domains\Parking\Models\ParkingLot::first();
+        $base = "/api/parking-lots/{$lot->id}";
+
+        // Fill all 10 motorcycle spots.
+        for ($i = 1; $i <= 10; $i++) {
+            $this->postJson("{$base}/sessions", [
+                'license_plate' => "MC-{$i}",
+                'vehicle_type' => 'motorcycle',
+            ])->assertStatus(201);
+        }
+
+        // Snapshot baseline blocked_count map.
+        $baseline = \App\Domains\Parking\Models\VanWindow::query()
+            ->pluck('blocked_count', 'id')->toArray();
+
+        // 11th motorcycle should fall back to a car spot.
+        $response = $this->postJson("{$base}/sessions", [
+            'license_plate' => 'MC-11',
+            'vehicle_type' => 'motorcycle',
+        ])->assertStatus(201);
+
+        $fallbackSpot = $response->json('spots.0');
+        $this->assertSame('car', $fallbackSpot['type'], 'motorcycle should fall back to a car spot');
+
+        $after = \App\Domains\Parking\Models\VanWindow::query()
+            ->pluck('blocked_count', 'id')->toArray();
+
+        // At least one overlapping window must have blocked_count incremented.
+        // Up to 3 windows include this spot.
+        $diff = 0;
+        foreach ($after as $id => $bc) {
+            if ($bc > ($baseline[$id] ?? 0)) {
+                $diff++;
+            }
+        }
+        $this->assertGreaterThanOrEqual(1, $diff, 'fallback to a car spot should bump at least 1 overlapping van_window');
+        $this->assertLessThanOrEqual(3, $diff, 'a single car spot belongs to at most 3 van_windows');
+
+        $this->assertBlockedCountInvariant();
+    }
+
+    public function test_unpark_van_resets_blocked_count(): void
+    {
+        $lot = \App\Domains\Parking\Models\ParkingLot::first();
+        $base = "/api/parking-lots/{$lot->id}";
+
+        $baselineMap = \App\Domains\Parking\Models\VanWindow::query()
+            ->pluck('blocked_count', 'id')->toArray();
+
+        $this->postJson("{$base}/sessions", [
+            'license_plate' => 'VAN-RESET',
+            'vehicle_type' => 'van',
+        ])->assertStatus(201);
+
+        $this->deleteJson("{$base}/vehicles/VAN-RESET")->assertStatus(204);
+
+        $finalMap = \App\Domains\Parking\Models\VanWindow::query()
+            ->pluck('blocked_count', 'id')->toArray();
+        foreach ($baselineMap as $id => $expected) {
+            $this->assertSame($expected, $finalMap[$id] ?? null, "Window {$id} blocked_count should return to baseline");
+        }
+
+        $this->assertBlockedCountInvariant();
+
+        // The van's window itself (now unknown which one) — all should be free.
+        $occupied = \App\Domains\Parking\Models\VanWindow::whereNotNull('parking_id')->count();
+        $this->assertSame(0, $occupied);
+    }
+
+    public function test_van_park_leaves_own_window_blocked_count_zero(): void
+    {
+        $lot = \App\Domains\Parking\Models\ParkingLot::first();
+        $base = "/api/parking-lots/{$lot->id}";
+
+        $this->postJson("{$base}/sessions", [
+            'license_plate' => 'VAN-OWN',
+            'vehicle_type' => 'van',
+        ])->assertStatus(201);
+
+        // The window the van just took has parking_id non-null AND blocked_count = 0.
+        $occupiedWindow = \App\Domains\Parking\Models\VanWindow::whereNotNull('parking_id')->first();
+        $this->assertNotNull($occupiedWindow);
+        $this->assertSame(0, $occupiedWindow->blocked_count, 'A van does not block its own window');
+
+        $this->assertBlockedCountInvariant();
+    }
+
+    // -----------------------------------------------------------------
+    // Group C: Allocator on the new query path
+    // -----------------------------------------------------------------
+
+    public function test_van_skips_window_with_blocked_underlying_spot(): void
+    {
+        $lot = \App\Domains\Parking\Models\ParkingLot::first();
+        $base = "/api/parking-lots/{$lot->id}";
+
+        // Park a car at section A, row 2, column 3 (middle of section A row 2).
+        // This blocks ALL windows in section A row 2 (start_column 1, 2, 3 each
+        // include column 3 in their 3-spot span). So the van must pick from
+        // section A row 3, or section B.
+        $sectionA = \App\Domains\Parking\Models\Section::where('name', 'A')->first();
+        $targetSpot = \App\Domains\Parking\Models\Spot::query()
+            ->where('section_id', $sectionA->id)
+            ->where('grid_row', 2)
+            ->where('grid_column', 3)
+            ->where('type', 'car')
+            ->first();
+
+        // Directly mark this spot as taken (no need to go through the API).
+        $parking = \App\Domains\Parking\Models\ParkingSession::create([
+            'parking_lot_id' => $lot->id,
+            'vehicle_id' => \App\Domains\Parking\Models\Vehicle::create([
+                'parking_lot_id' => $lot->id,
+                'license_plate' => 'PRE-BLOCK',
+                'type' => 'car',
+            ])->id,
+            'started_at' => now(),
+        ]);
+        $targetSpot->update(['parking_id' => $parking->id]);
+        app(\App\Domains\Parking\Services\SpotAllocator::class)
+            ->bumpBlockedCountForCarSpot(
+                sectionId: $targetSpot->section_id,
+                gridRow: $targetSpot->grid_row,
+                gridColumn: $targetSpot->grid_column,
+            );
+
+        // Now request a van; should NOT use any window in section A row 2.
+        $response = $this->postJson("{$base}/sessions", [
+            'license_plate' => 'VAN-SKIP',
+            'vehicle_type' => 'van',
+        ])->assertStatus(201);
+
+        $spotsTaken = collect($response->json('spots'));
+        $notInBlockedRow = $spotsTaken->every(
+            fn ($s) => ! ($s['section_id'] === $sectionA->id && $s['grid_row'] === 2)
+        );
+        $this->assertTrue($notInBlockedRow, 'Van must avoid section A row 2 entirely');
+    }
+
+    public function test_van_returns_409_when_all_windows_blocked(): void
+    {
+        $lot = \App\Domains\Parking\Models\ParkingLot::first();
+        $base = "/api/parking-lots/{$lot->id}";
+
+        // Pre-occupy column 3 of every car row in both sections — that's 4
+        // car spots, blocking every van window in the lot.
+        $allocator = app(\App\Domains\Parking\Services\SpotAllocator::class);
+        foreach (\App\Domains\Parking\Models\Section::all() as $section) {
+            foreach ([2, 3] as $row) {
+                $spot = \App\Domains\Parking\Models\Spot::query()
+                    ->where('section_id', $section->id)
+                    ->where('grid_row', $row)
+                    ->where('grid_column', 3)
+                    ->first();
+                $parking = \App\Domains\Parking\Models\ParkingSession::create([
+                    'parking_lot_id' => $lot->id,
+                    'vehicle_id' => \App\Domains\Parking\Models\Vehicle::create([
+                        'parking_lot_id' => $lot->id,
+                        'license_plate' => "BLOCK-{$section->id}-{$row}",
+                        'type' => 'car',
+                    ])->id,
+                    'started_at' => now(),
+                ]);
+                $spot->update(['parking_id' => $parking->id]);
+                $allocator->bumpBlockedCountForCarSpot(
+                    sectionId: $spot->section_id,
+                    gridRow: $spot->grid_row,
+                    gridColumn: $spot->grid_column,
+                );
+            }
+        }
+
+        $this->postJson("{$base}/sessions", [
+            'license_plate' => 'VAN-FAIL',
+            'vehicle_type' => 'van',
+        ])->assertStatus(409);
+    }
+
+    /**
+     * Independent greedy non-overlapping van count, computed in PHP from raw
+     * spots state. Used to cross-check countAvailableVanSpaces.
+     */
+    private function independentGreedyVanCount(int $parkingLotId): int
+    {
+        $spots = \App\Domains\Parking\Models\Spot::query()
+            ->where('parking_lot_id', $parkingLotId)
+            ->where('type', 'car')
+            ->orderBy('section_id')->orderBy('grid_row')->orderBy('grid_column')
+            ->get(['section_id', 'grid_row', 'grid_column', 'parking_id']);
+
+        $byRow = $spots->groupBy(fn ($s) => "{$s->section_id}:{$s->grid_row}");
+        $total = 0;
+
+        foreach ($byRow as $rowSpots) {
+            $rowSpots = $rowSpots->values();
+            $run = 0;
+            $prevCol = null;
+
+            foreach ($rowSpots as $s) {
+                $colOk = $prevCol === null || $s->grid_column === $prevCol + 1;
+                if ($s->parking_id === null && $colOk) {
+                    $run++;
+                    if ($run === 3) {
+                        $total++;
+                        $run = 0; // claim and reset; non-overlapping packing
+                        $prevCol = null;
+                        continue;
+                    }
+                } else {
+                    $run = $s->parking_id === null ? 1 : 0;
+                }
+                $prevCol = $s->grid_column;
+            }
+        }
+        return $total;
+    }
+
+    public function test_available_van_spaces_matches_independent_greedy_after_sequence(): void
+    {
+        $lot = \App\Domains\Parking\Models\ParkingLot::first();
+        $base = "/api/parking-lots/{$lot->id}";
+
+        $sequence = [
+            ['park', 'car',        'CAR-G1'],
+            ['park', 'van',        'VAN-G1'],
+            ['park', 'motorcycle', 'MC-G1'],
+            ['park', 'car',        'CAR-G2'],
+            ['unpark', null,       'VAN-G1'],
+            ['park', 'van',        'VAN-G2'],
+        ];
+
+        foreach ($sequence as [$op, $type, $plate]) {
+            if ($op === 'park') {
+                $this->postJson("{$base}/sessions", [
+                    'license_plate' => $plate,
+                    'vehicle_type' => $type,
+                ])->assertStatus(201);
+            } else {
+                $this->deleteJson("{$base}/vehicles/{$plate}")->assertStatus(204);
+            }
+
+            $apiCount = $this->getJson("{$base}/availability")
+                ->json('available_van_spaces');
+            $expected = $this->independentGreedyVanCount($lot->id);
+            $this->assertSame(
+                $expected,
+                $apiCount,
+                "Mismatch after op={$op} plate={$plate}: greedy={$expected}, api={$apiCount}"
+            );
+        }
     }
 }

@@ -3,6 +3,7 @@
 namespace App\Domains\Parking\Actions;
 
 use App\Domains\Parking\Data\LotAvailabilityData;
+use App\Domains\Parking\Data\SpotType;
 use App\Domains\Parking\Services\SpotAllocator;
 use Illuminate\Support\Facades\DB;
 
@@ -14,14 +15,17 @@ final class GetLotAvailability
 
     public function handle(int $parkingLotId): LotAvailabilityData
     {
+        $motorcycle = SpotType::Motorcycle->value;
+        $car = SpotType::Car->value;
+
         $stats = DB::table('spots')
             ->where('parking_lot_id', $parkingLotId)
             ->selectRaw('count(*) as total')
-            ->selectRaw("count(*) filter (where type = 'motorcycle') as total_motorcycle")
-            ->selectRaw("count(*) filter (where type = 'car') as total_car")
+            ->selectRaw("count(*) filter (where type = ?) as total_motorcycle", [$motorcycle])
+            ->selectRaw("count(*) filter (where type = ?) as total_car", [$car])
             ->selectRaw('count(*) filter (where parking_id is null) as total_available')
-            ->selectRaw("count(*) filter (where type = 'motorcycle' and parking_id is null) as available_motorcycle")
-            ->selectRaw("count(*) filter (where type = 'car' and parking_id is null) as available_car")
+            ->selectRaw("count(*) filter (where type = ? and parking_id is null) as available_motorcycle", [$motorcycle])
+            ->selectRaw("count(*) filter (where type = ? and parking_id is null) as available_car", [$car])
             ->first();
 
         $availableVanSpaces = $this->spotAllocator->countAvailableVanSpaces($parkingLotId);

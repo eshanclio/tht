@@ -2,23 +2,22 @@
 
 namespace App\Domains\Parking\Actions;
 
+use App\Domains\Parking\Data\AllocationResult;
 use App\Domains\Parking\Data\ParkVehicleData;
+use App\Domains\Parking\Data\SpotType;
 use App\Domains\Parking\Data\VehicleType;
 use App\Domains\Parking\Exceptions\VehicleAlreadyParkedException;
 use App\Domains\Parking\Exceptions\VehicleTypeMismatchException;
 use App\Domains\Parking\Models\ParkingSession;
 use App\Domains\Parking\Models\Spot;
 use App\Domains\Parking\Models\Vehicle;
+use App\Domains\Parking\Models\VanWindow;
 use App\Domains\Parking\Services\SpotAllocator;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 
 final class ParkVehicle
 {
-    // Manual namespace for pg_advisory_xact_lock. Bump if other features
-    // start using advisory locks and risk colliding on the same (ns, id) key.
-    private const int VAN_LOCK_NAMESPACE = 1;
-
     public function __construct(
         private readonly SpotAllocator $spotAllocator,
     ) {}
@@ -26,6 +25,9 @@ final class ParkVehicle
     public function handle(ParkVehicleData $data): ParkingSession
     {
         try {
+            // attempts: 3 — Laravel retries automatically on Postgres deadlock
+            // SQLSTATE 40P01 / 40001 raised during the blocked_count neighbor
+            // UPDATE phase. Domain exceptions propagate immediately.
             return DB::transaction(function () use ($data): ParkingSession {
                 $vehicle = Vehicle::createOrFirst(
                     [
@@ -42,40 +44,67 @@ final class ParkVehicle
                     );
                 }
 
-                // Vans need the per-lot advisory lock to make consecutive-spot
-                // allocation atomic across concurrent requests. Cars and
-                // motorcycles rely on SELECT ... FOR UPDATE against the partial
-                // indexes plus the parkings_active_vehicle_unique constraint.
-                if ($data->vehicleType === VehicleType::Van) {
-                    DB::statement(
-                        'SELECT pg_advisory_xact_lock(?, ?)',
-                        [self::VAN_LOCK_NAMESPACE, $data->parkingLotId],
-                    );
-                }
-
-                $spotIds = $this->spotAllocator->allocate(
+                $result = $this->spotAllocator->allocate(
                     $data->parkingLotId,
                     $data->vehicleType,
                 );
 
                 // Duplicate active parkings are prevented by the
-                // `parkings_active_vehicle_unique` partial index; a concurrent
-                // INSERT throws UniqueConstraintViolationException, caught below.
-                // The entire transaction (vehicle upsert + spot reservation) is
-                // rolled back when that happens.
+                // parkings_active_vehicle_unique partial index; a concurrent
+                // INSERT throws UniqueConstraintViolationException, caught
+                // outside and rethrown as VehicleAlreadyParkedException.
                 $parking = ParkingSession::create([
                     'parking_lot_id' => $data->parkingLotId,
                     'vehicle_id' => $vehicle->id,
                     'started_at' => now(),
                 ]);
 
-                Spot::whereIn('id', $spotIds)
-                    ->update(['parking_id' => $parking->id]);
+                $this->applyAllocation($result, $parking, $data->vehicleType);
 
                 return $parking->load(['vehicle', 'spots']);
-            });
+            }, attempts: 3);
         } catch (UniqueConstraintViolationException) {
             throw new VehicleAlreadyParkedException;
+        }
+    }
+
+    /**
+     * Claim spots + window and update blocked_count on overlapping neighbors.
+     * Runs inside the caller's transaction.
+     */
+    private function applyAllocation(
+        AllocationResult $result,
+        ParkingSession $parking,
+        VehicleType $vehicleType,
+    ): void {
+        Spot::whereIn('id', $result->spotIds)
+            ->update(['parking_id' => $parking->id]);
+
+        if ($vehicleType === VehicleType::Van) {
+            VanWindow::whereKey($result->windowId)
+                ->update(['parking_id' => $parking->id]);
+
+            for ($offset = 0; $offset < 3; $offset++) {
+                $this->spotAllocator->bumpBlockedCountForCarSpot(
+                    sectionId: $result->sectionId,
+                    gridRow: $result->gridRow,
+                    gridColumn: $result->startColumn + $offset,
+                    excludeWindowId: $result->windowId,
+                );
+            }
+            return;
+        }
+
+        // Car or motorcycle: 1 spot. Motorcycle spots are never part of any
+        // van_window, so the bump only runs when the chosen spot is a car spot
+        // (true for cars unconditionally, and for motorcycle-fallback-to-car).
+        $spot = Spot::whereKey($result->spotIds[0])->first();
+        if ($spot->type === SpotType::Car) {
+            $this->spotAllocator->bumpBlockedCountForCarSpot(
+                sectionId: $spot->section_id,
+                gridRow: $spot->grid_row,
+                gridColumn: $spot->grid_column,
+            );
         }
     }
 }

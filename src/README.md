@@ -13,7 +13,7 @@ php artisan migrate --seed
 php artisan test
 ```
 
-The seeder creates **Main Lot** with two sections (A and B), each a 3×5 grid. Row 1 of each section holds 5 motorcycle spots; rows 2 and 3 hold 5 car spots each — 30 spots total.
+The seeder creates **Main Lot** with two sections (A and B), each a 3×5 grid. Row 1 of each section holds 5 motorcycle spots; rows 2 and 3 hold 5 car spots each — 30 spots total. The seeder also materializes **12 van candidate windows** (3 sliding-window placements per car row × 4 car rows), used by the van allocator's single-statement candidate pick.
 
 ---
 
@@ -133,6 +133,19 @@ spots
   grid_column INTEGER                  ← ordinal column within a (section, row); consecutive = differs by 1
   parking_id FK → parkings (nullable) ← NULL = available, non-null = occupied
 
+van_windows
+  id
+  parking_lot_id (FK → parking_lots)
+  section_id (FK → sections)
+  grid_row    INTEGER
+  start_column INTEGER             ← leftmost car spot's grid_column
+  car_spot_left_id  FK → spots
+  car_spot_mid_id   FK → spots
+  car_spot_right_id FK → spots
+  parking_id FK → parkings (nullable) ← NULL = available, non-null = van occupies this window
+  blocked_count SMALLINT NOT NULL  ← count of W's car spots taken by OTHER sessions
+  UNIQUE(section_id, grid_row, start_column)
+
 vehicles
   id, parking_lot_id (FK → parking_lots)
   license_plate, type
@@ -150,10 +163,11 @@ parkings                               ← Eloquent model: ParkingSession
 
 | Index | Filter | Used by |
 |---|---|---|
-| `spots_available_car_section_idx` on `(section_id, grid_row, grid_column)` | `type='car' AND parking_id IS NULL` | Van consecutive-spot scan |
+| `van_windows_available_idx` on `(parking_lot_id, id)` | `parking_id IS NULL AND blocked_count = 0` | Van allocator candidate scan |
+| `van_windows_active_idx` UNIQUE on `(parking_id)` | `parking_id IS NOT NULL` | Active van session lookup; one-session-per-window guarantee |
 | `spots_available_car_lot_idx` on `(parking_lot_id)` | `type='car' AND parking_id IS NULL` | Car allocation |
 | `spots_parking_id_idx` on `(parking_id)` | `parking_id IS NOT NULL` | Unpark: locate all spots belonging to a session |
-| `parkings_active_vehicle_unique` (UNIQUE) on `(vehicle_id)` | `ended_at IS NULL` | Duplicate-active-session guard at DB layer + active-session lookup on unpark |
+| `parkings_active_vehicle_unique` UNIQUE on `(vehicle_id)` | `ended_at IS NULL` | Duplicate-active-session guard |
 
 Motorcycle allocation and per-lot availability counts are served by the plain `spots(parking_lot_id)` index — the motorcycle allocator query needs car rows as fallback, so a partial index scoped to motorcycle rows cannot serve it.
 
@@ -171,71 +185,67 @@ Motorcycle allocation and per-lot availability counts are served by the plain `s
 
 **Car:** Straightforward `WHERE type = 'car' AND parking_id IS NULL ORDER BY id LIMIT 1` with a row-level lock.
 
-**Van — consecutive-spot detection:**
+**Van — single-statement candidate pick:**
 
-The same gaps-and-islands technique used by `countAvailableVanSpaces` is extended to also return the three winning spot IDs, keeping the entire scan in SQL:
+Van allocation is one atomic 4-way join with `FOR UPDATE OF w, sl, sm, sr SKIP LOCKED LIMIT 1`. The candidate `van_windows` row is locked together with its 3 underlying spots; any contended row causes the candidate to be skipped. No advisory lock, no retry loop in the allocator.
 
 ```sql
--- groups: assign each free car spot a `grp` constant shared by all spots in
--- the same consecutive run within one (section_id, grid_row).
-WITH groups AS (
-    SELECT id, section_id, grid_row, grid_column,
-           grid_column - ROW_NUMBER() OVER (
-               PARTITION BY section_id, grid_row ORDER BY grid_column
-           ) AS grp
-    FROM spots
-    WHERE parking_lot_id = ? AND type = 'car' AND parking_id IS NULL
-),
--- runs: keep only runs of ≥ 3 and record the lowest column for tie-breaking.
-runs AS (
-    SELECT section_id, grid_row, grp, MIN(grid_column) AS start_col
-    FROM groups GROUP BY section_id, grid_row, grp HAVING COUNT(*) >= 3
-),
--- winner: pick the first qualifying run by (section_id, grid_row, start_col).
-winner AS (
-    SELECT section_id, grid_row, grp FROM runs
-    ORDER BY section_id, grid_row, start_col LIMIT 1
-)
-SELECT g.id FROM groups g
-JOIN winner w ON g.section_id = w.section_id
-             AND g.grid_row   = w.grid_row
-             AND g.grp        = w.grp
-ORDER BY g.grid_column LIMIT 3
+SELECT w.id, w.section_id, w.grid_row, w.start_column,
+       w.car_spot_left_id, w.car_spot_mid_id, w.car_spot_right_id
+FROM   van_windows w
+JOIN   spots sl ON sl.id = w.car_spot_left_id
+JOIN   spots sm ON sm.id = w.car_spot_mid_id
+JOIN   spots sr ON sr.id = w.car_spot_right_id
+WHERE  w.parking_lot_id = ?
+  AND  w.parking_id IS NULL
+  AND  w.blocked_count = 0
+  AND  sl.parking_id IS NULL
+  AND  sm.parking_id IS NULL
+  AND  sr.parking_id IS NULL
+ORDER  BY w.id
+LIMIT  1
+FOR UPDATE OF w, sl, sm, sr SKIP LOCKED;
 ```
 
-The query returns exactly 3 spot IDs. A follow-up `SELECT ... FOR UPDATE` on those three rows confirms they are still free immediately before the `UPDATE`.
+`blocked_count` is a denormalized counter on each `van_windows` row, maintained by `SpotAllocator` inside the same transaction as `spots.parking_id` updates. Invariant:
 
-**Van space counting — gaps-and-islands SQL:**
+```
+W.blocked_count == count(s in W's 3 underlying car spots:
+                         s.parking_id IS NOT NULL
+                         AND s.parking_id IS DISTINCT FROM W.parking_id)
+```
 
-`countAvailableVanSpaces` uses a three-level subquery to avoid loading rows into PHP:
+When a car (or motorcycle-fallback-to-car) takes a spot, `SpotAllocator::bumpBlockedCountForCarSpot` increments the up-to-3 overlapping windows by coordinate (`section_id = ? AND grid_row = ? AND start_column BETWEEN ?-2 AND ?`). When a van parks at window W, the same bump runs for each of W's 3 spots with `excludeWindowId = W.id` so W itself stays at `blocked_count = 0`. Unpark reverses each step.
+
+**Van space counting — read-time gaps-and-islands on `van_windows`:**
+
+`countAvailableVanSpaces` returns the actual number of non-overlapping vans that can park right now, computed live on each call. No counter is persisted. The query runs on `van_windows` filtered by the partial index (`parking_id IS NULL AND blocked_count = 0`):
 
 ```sql
--- Level 1: identify each consecutive run within one (section, grid_row).
--- Subtracting ROW_NUMBER() from grid_column yields a constant value
--- ("grp") for spots that belong to the same uninterrupted run.
+-- Stage 1: identify consecutive chains of available windows per (section, row).
 SELECT section_id, grid_row,
-       grid_column - ROW_NUMBER() OVER (PARTITION BY section_id, grid_row ORDER BY grid_column) AS grp
-FROM spots WHERE type = 'car' AND parking_id IS NULL AND parking_lot_id = ?
+       start_column - ROW_NUMBER() OVER (
+           PARTITION BY section_id, grid_row ORDER BY start_column
+       ) AS grp
+FROM   van_windows
+WHERE  parking_lot_id = ? AND parking_id IS NULL AND blocked_count = 0;
 
--- Level 2: measure the length of each run.
-SELECT COUNT(*) AS run_length FROM level1 GROUP BY section_id, grid_row, grp
+-- Stage 2: measure chain length.
+SELECT COUNT(*) AS run_length FROM stage1 GROUP BY section_id, grid_row, grp;
 
--- Level 3: a run of length L yields floor(L / 3) non-overlapping van slots.
-SELECT COALESCE(SUM(FLOOR(run_length / 3)), 0) FROM level2
+-- Stage 3: a chain of L available windows = L+2 free car spots = floor((L+2)/3) vans.
+SELECT COALESCE(SUM(FLOOR((run_length + 2) / 3)), 0) AS total FROM stage2;
 ```
 
 ### Concurrency & Atomicity
 
-**Vans** must atomically claim three consecutive spots. The implementation uses two layers:
+**Vans** allocate via one atomic statement that locks the candidate window and its 3 underlying spots together (`SELECT … FOR UPDATE OF w, sl, sm, sr SKIP LOCKED LIMIT 1`). Concurrent vans pick different windows because `SKIP LOCKED` makes the second pick observe the first's lock and move on. Concurrent cars/motorcycles never block vans (each is a separate `FOR UPDATE SKIP LOCKED` on its own row), and vice versa.
 
-1. **`pg_advisory_xact_lock(namespace, parking_lot_id)`** — Acquired at the start of every van park request within the transaction. This serializes all concurrent van requests for the same lot, ensuring only one transaction at a time performs the consecutive-spot scan and claims spots. The lock is transaction-scoped (released automatically on commit or rollback).
-2. **`SELECT ... FOR UPDATE` on the three candidates** — Belt-and-braces confirmation that all three spots are still free immediately before the `UPDATE`. If any spot was taken between advisory lock acquisition and the row lock, a `NoAvailableSpotException` is raised — no partial reservation ever occurs.
+**Cars and motorcycles** use single-row `FOR UPDATE SKIP LOCKED` picks. Motorcycles use a `CASE WHEN type='motorcycle'` ordering so they prefer motorcycle spots and fall back to car spots automatically.
 
-Cars and motorcycles use only `SELECT ... FOR UPDATE` — single-spot allocation is inherently atomic.
+**`blocked_count` neighbor UPDATEs.** After the SKIP-LOCKED pick, every park/unpark updates the up-to-3 overlapping `van_windows` rows by coordinate. Two concurrent vans in nearby windows (`|S₁ − S₂| ≤ 2` in the same `(section, row)`) can deadlock here — Postgres detects the cycle (SQLSTATE 40P01) and aborts the loser. `ParkVehicle::handle` and `UnparkVehicle::handle` use `DB::transaction($callback, attempts: 3)` so Laravel re-runs the transaction automatically; the SKIP-LOCKED re-scan naturally avoids the contested window on retry.
 
-**Duplicate-session prevention** is enforced at the database layer:
-
-`UNIQUE INDEX parkings_active_vehicle_unique ON parkings(vehicle_id) WHERE ended_at IS NULL` guarantees at most one active session per vehicle. `ParkVehicle` does not perform an application-level pre-check — it relies entirely on this partial unique index. If a concurrent request attempts to insert a second active session for the same vehicle, the `INSERT` raises `UniqueConstraintViolationException`, which `ParkVehicle` catches inside the transaction (rolling back the vehicle upsert and spot reservation) and rethrows as `VehicleAlreadyParkedException` → `409`. Collapsing duplicate prevention to a single layer avoids an extra `SELECT ... FOR UPDATE` round-trip on every park request and removes a class of TOCTOU races that any application-level check would carry.
+**Duplicate-session prevention** is unchanged: the partial unique index `parkings_active_vehicle_unique` raises `UniqueConstraintViolationException` on duplicate INSERTs, which `ParkVehicle` catches and rethrows as `VehicleAlreadyParkedException`.
 
 ### Multi-Tenancy
 
@@ -267,32 +277,23 @@ Cars and motorcycles use only `SELECT ... FOR UPDATE` — single-spot allocation
 
 ## Tradeoffs
 
-### Advisory lock for vans vs. pessimistic row-level locking
+### Pre-materialized candidate table vs. runtime gaps-and-islands
 
-**Chosen:** `pg_advisory_xact_lock(namespace, lot_id)` + `SELECT ... FOR UPDATE` on the winning spots.
+**Chosen:** Materialize every sliding-window van placement as a row in `van_windows`. The allocator's hot path is one atomic `SELECT … FOR UPDATE OF w, sl, sm, sr SKIP LOCKED LIMIT 1`. `blocked_count` is a denormalized counter maintained by `SpotAllocator` on park/unpark.
 
-**Why `SELECT ... FOR UPDATE` alone is insufficient for vans:**
+**Why not runtime gaps-and-islands on `spots`:** The original implementation did exactly that, plus a `pg_advisory_xact_lock` to serialize vans on the same lot. Throughput was throttled by the lot-scoped advisory lock even when concurrent vans would have targeted disjoint windows. The two-step scan-then-lock had a race that the advisory lock papered over rather than structurally eliminating.
 
-Van allocation is a two-step process: (1) scan all free car spots and detect 3 consecutive ones in PHP, then (2) re-`SELECT ... FOR UPDATE` the winners before updating. There is a race window between steps 1 and 2. If two van requests run concurrently:
+**Costs:**
 
-- Van A finds spots {1, 2, 3} and tries to lock them.
-- Van B finds the same spots {1, 2, 3} and tries to lock them.
-- Van A locks spot 1; Van B locks spot 3. Each waits for the other → **deadlock**.
+- Write amplification — every park/unpark of a car spot UPDATEs up to 3 overlapping `van_windows` rows; every van park/unpark UPDATEs up to 4 neighbor rows for `blocked_count`. Bounded and small.
+- New denormalized invariant (`blocked_count`) maintained by application code, not by DB triggers. Defended by a property-style invariant test that runs after every operation in a randomized park/unpark sequence.
+- A cross-class deadlock surface during the neighbor UPDATE phase; absorbed by `DB::transaction(..., attempts: 3)`.
 
-`pg_advisory_xact_lock(VAN_LOCK_NAMESPACE, lot_id)` eliminates this by serializing all van requests for the same lot before any scan begins. Only one van allocation runs at a time per lot; the scan-then-lock sequence becomes fully atomic from a concurrency perspective.
+**Won't catch on its own:** any future writer of `spots.parking_id` that bypasses `SpotAllocator` would drift `blocked_count`. Documented in the migration header and enforced by the test suite.
 
-| | `SELECT ... FOR UPDATE` | `pg_advisory_xact_lock` |
-|---|---|---|
-| Locks | Specific database rows | An application-defined integer key |
-| Targets | Rows that exist | Any logical resource (including multi-step operations) |
-| Deadlock risk | Higher with multi-row locking across transactions | Lower — one key per lot, acquired before any row touches |
-| Scope | Transaction (auto-released on commit/rollback) | Transaction (auto-released on commit/rollback) |
+#### `blocked_count` invariant
 
-**Why not lock all free car spots upfront with `FOR UPDATE`?** That would block every concurrent car allocation while any van scans its section — degrading throughput unnecessarily. The advisory lock is lot-scoped, not row-scoped: it serializes only van-vs-van on the same lot, leaving car and motorcycle row locks entirely uncontested.
-
-**Why not Redis distributed lock?** Unnecessary for a single PostgreSQL primary. The advisory lock participates in the DB transaction lifecycle automatically — no separate release call, no TTL management, no split-brain risk.
-
-**Alternative considered:** `SELECT ... FOR UPDATE SKIP LOCKED` on all free car spots in the section, then detect the consecutive run inside the transaction. Avoids the advisory lock but holds row-level locks on many rows for the full duration of the scan, blocking concurrent car/motorcycle allocations in the same section.
+`blocked_count` is application-maintained denormalized state, not a DB-enforced constraint. It is the load-bearing column that makes the SKIP-LOCKED candidate pick a true O(1)-on-the-index lookup: the partial index `van_windows_available_idx` filters on `parking_id IS NULL AND blocked_count = 0`, so the allocator never reads a window whose underlying spots are taken. The invariant is verified by a property test that issues a randomized sequence of park/unpark operations and after every step asserts, for every window W, that `W.blocked_count` equals the count of W's underlying car spots whose `parking_id` is set to some session other than W's own.
 
 ### Denormalized `spots.parking_lot_id`
 
@@ -332,9 +333,9 @@ The horizontal-only constraint also keeps the allocator a single index-ordered s
 
 ### Gaps-and-islands SQL for van space counting
 
-**Chosen:** Three-level subquery using `ROW_NUMBER() OVER (PARTITION BY section_id, grid_row ORDER BY grid_column)` to identify runs, then `FLOOR(run_length / 3)` for non-overlapping van slots.
+**Chosen:** Three-stage subquery over `van_windows` using `ROW_NUMBER() OVER (PARTITION BY section_id, grid_row ORDER BY start_column)` to identify consecutive chains of available windows, then `FLOOR((run_length + 2) / 3)` for non-overlapping van slots.
 
-**Alternative:** Fetch all free car spots into PHP and compute in-process. Simpler to read, but transfers all rows across the wire and does O(n) work in the application tier. The SQL approach is a single round-trip and scales to large lots without memory pressure.
+**Alternative:** Fetch the candidate rows into PHP and compute in-process. Simpler to read, but transfers rows across the wire and does O(n) work in the application tier. The SQL approach is a single round-trip and scales to large lots without memory pressure.
 
 ---
 
@@ -344,9 +345,9 @@ The horizontal-only constraint also keeps the allocator a single index-ordered s
 
 **Dedicated `SpotOccupancy` model** — Track occupancy in a separate table where each row represents one spot in one session. Cleaner history and easier audit trail, but every allocator query becomes a join and the consecutive-spot scan must carry the join through to the window function. Complexity not justified.
 
-**Redis distributed lock for van concurrency** — Replace `pg_advisory_xact_lock` with a Redis `SET NX` or `Redlock`. Necessary only if multiple PostgreSQL primaries or external lock managers are required. For a single primary, the advisory lock is simpler and participates in the DB transaction lifecycle automatically.
+**Redis distributed lock for van concurrency** — Replace per-lot serialization with a Redis `SET NX` or `Redlock`. Necessary only if multiple PostgreSQL primaries or external lock managers are required. For a single primary, structural elimination via `SKIP LOCKED` on the pre-materialized `van_windows` table is simpler and stays inside the DB transaction lifecycle.
 
-**CQRS / pre-computed availability table** — Maintain a denormalized availability table updated by triggers or events. Eliminates the per-request aggregation query. Adds cache-invalidation complexity and eventual consistency that is not justified at this scale.
+**CQRS / pre-computed availability table** — The `van_windows` table is exactly this pattern, scoped to van candidate placements rather than full lot availability. It pays its way because the van allocator's hot path collapses to a single index seek + lock. A broader availability projection (per-lot counters maintained by triggers) was rejected: motorcycle / car counts are already cheap aggregates, and a full counter table would add cache-invalidation complexity without removing a hot query.
 
 ---
 
@@ -358,9 +359,9 @@ src/
 │   ├── Domains/
 │   │   └── Parking/
 │   │       ├── Actions/           ParkVehicle, UnparkVehicle, GetLotAvailability
-│   │       ├── Data/              DTOs + enums (VehicleType, SpotType, …)
+│   │       ├── Data/              DTOs + enums (VehicleType, SpotType, AllocationResult, …)
 │   │       ├── Exceptions/        Self-rendering domain exceptions
-│   │       ├── Models/            ParkingLot, Section, Spot, Vehicle, ParkingSession
+│   │       ├── Models/            ParkingLot, Section, Spot, Vehicle, ParkingSession, VanWindow
 │   │       └── Services/          SpotAllocator
 │   ├── Http/
 │   │   ├── Controllers/           ParkingController
@@ -380,7 +381,7 @@ src/
 │   └── api.php
 └── tests/
     └── Feature/
-        └── ParkingApiTest.php     35 feature tests across 4 groups
+        └── ParkingApiTest.php     feature tests across 5 groups (see Test Coverage Groups)
 ```
 
 ### Test Coverage Groups
@@ -391,3 +392,4 @@ src/
 | Rejection / errors | Car blocked when only motorcycle spots remain, van rejected on fragmented spots, van rejected when < 3 spots exist, duplicate park, unpark unknown vehicle, unpark wrong lot, van rejected at row boundary, van rejected on aisle split |
 | Validation | Missing license plate, invalid vehicle type, nonexistent lot (404), type mismatch on re-park, same plate at two different lots (multi-tenancy), park response includes grid coordinates |
 | State & availability | Capacity totals, occupied spot counts, van space reduction on occupancy, multi-tenancy isolation, full-lot rejection, availability 404 for nonexistent lot, vertical adjacency does not count as van slot |
+| Sliding-window invariants | seeder integrity (12 windows, correct geometry, idempotent), `blocked_count` invariant after arbitrary park/unpark, motorcycle fallback bumps blocked_count, unpark van resets blocked_count, van does not block its own window, van skips window with blocked spot, 409 when all windows blocked, availability matches independent greedy after sequence |
